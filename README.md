@@ -5,13 +5,13 @@ This repository documents an ongoing machine learning project analyzing air poll
 
 ---
 
-## 📌 Project Overview
+## Project Overview
 
 This project explores temporal and meteorological patterns in Beijing’s air quality using real-world PM2.5 sensor data. Following the **CRISP-DM methodology**, the notebook includes data cleaning, exploratory data analysis (EDA), and modeling (in progress). The project is designed to reflect a thoughtful, beginner-level understanding of python for data science and ML techniques.
 
 ---
 
-## 📁 Repository Structure
+## Repository Structure
 
 - `README.md` – Project overview and structure
 - `colab_notebook.ipynb` – Main analysis notebook (ongoing work)
