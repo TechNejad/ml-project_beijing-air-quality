@@ -1,7 +1,7 @@
 # Beijing Air Quality – A Machine Learning Project
 
-🚧 **Work in Progress**  
-This repository documents an ongoing machine learning project analyzing air pollution in Beijing (2010–2014). It is being developed as part of Fundamentals of Machine Learning course as part of the Master's of Artificial Intelligence For Sustainable Societies. 
+**Work in Progress**  
+This repository documents an ongoing machine learning project analyzing air pollution in Beijing (2010–2014). It is being developed as part of the Fundamentals of Machine Learning course as part of the Master's of Artificial Intelligence for Sustainable Societies. 
 
 ---
 
@@ -24,9 +24,9 @@ This project explores temporal and meteorological patterns in Beijing’s air qu
 - Handling Missing Data and Outliers  
 - Exploratory Data Analysis (EDA)  
 - Temporal Pattern Analysis  
-- Feature Engineering *(in progress)*  
-- Machine Learning Modeling *(in progress)*  
-- Model Evaluation & Interpretation *(in progress)*
+- Feature Engineering  
+- Machine Learning Modeling   
+- Model Evaluation & Interpretation 
 
 ---
 
