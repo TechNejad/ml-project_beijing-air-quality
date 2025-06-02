@@ -2,248 +2,179 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import datetime
-import requests
-import os
-import joblib  # NEW: for loading our trained model
+import datetime as dt
+import requests, os, joblib, pytz
 
-# --------------------------------------------------
-# 🔧  CONFIGURATION
-# --------------------------------------------------
-
-st.set_page_config(
-    page_title="Air Pollution Forecast",
-    page_icon="🌬️",
-    layout="wide"
-)
-
-# Light theme / basic styling
-st.markdown(
-    """
-    <style>
-        .main .block-container {background-color:#FFFFFF;color:#262730;padding:2rem;}
-        section[data-testid="stSidebar"]{background-color:#F0F2F6;color:#262730;}
-        h1,h2,h3,h4,h5,h6{color:#262730;}
-        .stTabs [data-baseweb="tab-list"]{gap:2px;background-color:#F0F2F6;}
-        .stTabs [data-baseweb="tab"]{height:50px;background-color:#F0F2F6;border-radius:4px 4px 0 0;padding:10px 16px;color:#262730;}
-        .stTabs [aria-selected="true"]{background-color:#FFFFFF;border-bottom:2px solid #FF4B4B;}
-        .stApp{background-color:#FFFFFF;}
-        .stButton button{background-color:#FF4B4B;color:white;}
-    </style>
-    """,
-    unsafe_allow_html=True,
-)
+# ------------------------------------------------------------------
+# 📄  PAGE CONFIG
+# ------------------------------------------------------------------
+st.set_page_config(page_title="Air Pollution Forecast", page_icon="🌬️", layout="wide")
 
 st.title("Air Pollution Forecast")
 
-# --------------------------------------------------
-# 📥  SIDEBAR
-# --------------------------------------------------
-with st.sidebar:
-    st.header("Settings")
-    city = st.text_input("City", value="Beijing")
-    forecast_button = st.button("Get Pollution Forecast", type="primary")
+# ------------------------------------------------------------------
+# 🔧  CONSTANTS & HELPERS
+# ------------------------------------------------------------------
+MODEL_PATH = "rf_pm25_model.pkl"  # → same folder as this file
+FORECAST_HOURS = 72              # how far ahead we predict
+HISTORY_HOURS  = 24              # pm2.5 history window for lags
 
-# --------------------------------------------------
-# 🌍  WEATHER DATA – Open‑Meteo API
-# --------------------------------------------------
+# -- AQI colour bands for quick chart shading
+aqi_bands = [(0,12,"#b8f4a8"), (12.1,35.4,"#ffffa1"), (35.5,55.4,"#ffd48c"),
+             (55.5,150.4,"#ff9999"), (150.5,250.4,"#c79ddf"), (250.5,500,"#a07cc8")]
 
-def fetch_weather_forecast(city: str):
-    """Query Open‑Meteo CMA endpoint and return parsed (hourly) forecast."""
-    city_coordinates = {
-        "beijing": {"lat": 39.9042, "lon": 116.4074},
-        "shanghai": {"lat": 31.2304, "lon": 121.4737},
-        "guangzhou": {"lat": 23.1291, "lon": 113.2644},
-        "shenzhen": {"lat": 22.5431, "lon": 114.0579},
-        "chengdu": {"lat": 30.5728, "lon": 104.0668},
-        "tianjin": {"lat": 39.3434, "lon": 117.3616},
-        "wuhan": {"lat": 30.5928, "lon": 114.3055},
-        "xian": {"lat": 34.3416, "lon": 108.9398},
-        "hangzhou": {"lat": 30.2741, "lon": 120.1551},
-        "nanjing": {"lat": 32.0603, "lon": 118.7969},
-    }
+# ------------------------------------------------------------------
+# ☁️  OPEN‑METEO ENDPOINTS
+# ------------------------------------------------------------------
+GEOCODE_URL   = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_URL   = "https://api.open-meteo.com/v1/forecast"
+AIRQUAL_URL   = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
-    key = city.lower().replace(" ", "")
-    lat, lon = city_coordinates.get(key, city_coordinates["beijing"]).values()
+def geocode_city(city: str):
+    resp = requests.get(GEOCODE_URL, params={"name": city, "count": 1})
+    resp.raise_for_status()
+    results = resp.json().get("results")
+    if not results:
+        raise ValueError("City not found in Open‑Meteo geocoder")
+    r = results[0]
+    return r["latitude"], r["longitude"], r["timezone"], r["name"]
 
+
+def fetch_weather(lat, lon, timezone):
     params = {
         "latitude": lat,
         "longitude": lon,
-        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,wind_speed_10m,wind_direction_10m,precipitation",
-        "forecast_days": 3,
-        "timezone": "auto",
+        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,wind_speed_10m,wind_direction_10m",
+        "forecast_hours": FORECAST_HOURS,
+        "timezone": timezone,
     }
-    try:
-        res = requests.get("https://api.open-meteo.com/v1/cma", params=params, timeout=15)
-        res.raise_for_status()
-        return process_open_meteo_data(res.json(), city)
-    except Exception as e:
-        st.error(f"Error fetching weather data ➜ {e}")
-        return None
+    r = requests.get(WEATHER_URL, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
 
-def process_open_meteo_data(api_json: dict, city: str):
-    """Convert Open‑Meteo JSON to a structure similar to OpenWeather (for legacy code)."""
-    hourly = api_json.get("hourly", {})
-    times = hourly.get("time", [])
-    forecast = []
-    for idx, ts in enumerate(times):
-        dt = datetime.datetime.fromisoformat(ts)
-        forecast.append(
-            {
-                "dt": int(dt.timestamp()),
-                "dt_txt": dt.strftime("%Y-%m-%d %H:%M:%S"),
-                "main": {
-                    "temp": hourly["temperature_2m"][idx],
-                    "pressure": hourly["pressure_msl"][idx],
-                    "humidity": hourly["relative_humidity_2m"][idx],
-                },
-                "wind": {
-                    "speed": hourly["wind_speed_10m"][idx],
-                    "deg": hourly["wind_direction_10m"][idx],
-                },
-                "dew_point": hourly["dew_point_2m"][idx],  # NEW
-                "rain": {"3h": hourly["precipitation"][idx]} if hourly["precipitation"][idx] > 0 else {},
-            }
-        )
-
-    return {
-        "list": forecast,
-        "city": {
-            "name": city,
-            "coord": {"lat": api_json.get("latitude"), "lon": api_json.get("longitude")},
-        },
+def fetch_pm25_history(lat, lon, timezone):
+    params = {
+        "latitude": lat,
+        "longitude": lon,
+        "hourly": "pm2_5",
+        "timezone": timezone,
+        "past_days": 3,         # get 72 h back (max 3)
+        "forecast_hours": FORECAST_HOURS,
     }
+    r = requests.get(AIRQUAL_URL, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
 
-# --------------------------------------------------
-# 🛠️  DATA PRE‑PROCESSING
-# --------------------------------------------------
-
-def preprocess_weather_data(raw_weather: dict) -> pd.DataFrame:
-    """Turn processed API json into a tidy DataFrame expected by the ML model."""
-    rows = []
-    for itm in raw_weather.get("list", []):
-        dt = datetime.datetime.fromtimestamp(itm["dt"])
-        main = itm["main"]
-        wind = itm["wind"]
-        rows.append(
-            {
-                "datetime": dt,
-                "Temp": main["temp"],          # rename to match model training
-                "Press": main["pressure"],
-                "Humidity": main["humidity"],  # not used by model but handy for charts
-                "WindSpeed": wind["speed"],
-                "DewP": itm.get("dew_point"),
-            }
-        )
-    df = pd.DataFrame(rows)
-    # Extra time‑based features if we want to plot / provide summary
-    if not df.empty:
-        df["Hour"] = df["datetime"].dt.hour
-        df["Day"] = df["datetime"].dt.day
-        df["Month"] = df["datetime"].dt.month
-    return df
-
-# --------------------------------------------------
-# 🤖  LOAD TRAINED RANDOM‑FOREST MODEL
-# --------------------------------------------------
-MODEL_PATH = "rf_pm25_model.pkl"  # Make sure this pickle sits next to this app
-
+# ------------------------------------------------------------------
+# 🤖  MODEL
+# ------------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not os.path.exists(MODEL_PATH):
-        st.stop(
-            f"❗ Trained model not found at '{MODEL_PATH}'. Upload it or change MODEL_PATH.")
+        st.error("Model file not found – upload rf_pm25_model.pkl")
+        st.stop()
     return joblib.load(MODEL_PATH)
 
+model = load_model()
+pre_feat_names = list(model.named_steps["preprocessor"].feature_names_in_)
+# Which lag / roll cols does the model need?
+lag_cols  = [c for c in pre_feat_names if "lag"  in c]
+roll_cols = [c for c in pre_feat_names if "roll" in c]
 
-def predict_pm25(model, weather_df: pd.DataFrame):
-    """Generate PM2.5 predictions using the pretrained sklearn pipeline."""
-    feature_cols = ["DewP", "Temp", "Press", "WindSpeed"]  # model_without_rain features
-    if any(col not in weather_df.columns for col in feature_cols):
-        missing = [c for c in feature_cols if c not in weather_df.columns]
-        st.error(f"Missing columns for prediction: {missing}")
-        return []
-    preds = model.predict(weather_df[feature_cols])
-    return preds.tolist()
+# Helpers to compute lags / rolls given history list
+def make_lag_features(history):
+    feats = {}
+    for col in lag_cols:
+        # expect name like "pm2.5_lag1" → lag=1
+        lag = int(col.split("lag")[-1])
+        feats[col] = history[-lag] if len(history) >= lag else history[0]
+    for col in roll_cols:
+        # expect name like "pm2.5_roll24" → window=24
+        win = int(col.split("roll")[-1])
+        feats[col] = float(np.mean(history[-win:])) if len(history) >= 1 else history[-1]
+    return feats
 
-# --------------------------------------------------
-# 🖍️  HELPER FUNCTIONS FOR UI
-# --------------------------------------------------
+# ------------------------------------------------------------------
+# 🏗️  FEATURE CONSTRUCTION
+# ------------------------------------------------------------------
 
-def pm25_to_aqi_category(pm25):
-    if pm25 <= 12:  # µg/m³
-        return "Good", "#00e400"
-    elif pm25 <= 35.4:
-        return "Moderate", "#ffff00"
-    elif pm25 <= 55.4:
-        return "Unhealthy for Sensitive Groups", "#ff7e00"
-    elif pm25 <= 150.4:
-        return "Unhealthy", "#ff0000"
-    elif pm25 <= 250.4:
-        return "Very Unhealthy", "#8f3f97"
-    else:
-        return "Hazardous", "#7e0023"
+def build_future_dataframe(weather_json, pm_json, tz):
+    # Weather future block
+    w_hr   = weather_json["hourly"]
+    times  = [dt.datetime.fromisoformat(t).replace(tzinfo=pytz.timezone(tz)) for t in w_hr["time"]][:FORECAST_HOURS]
+    # Past PM2.5 block (last HISTORY_HOURS)
+    aq_hr  = pm_json["hourly"]
+    past_times = [dt.datetime.fromisoformat(t).replace(tzinfo=pytz.timezone(tz)) for t in aq_hr["time"]]
+    past_vals  = aq_hr["pm2_5"]
+    # take the last HISTORY_HOURS actual values as history seed
+    history_pm25 = past_vals[-HISTORY_HOURS:]
 
+    rows, preds = [], []
+    for idx, t in enumerate(times):
+        # Base weather/time features
+        row = {
+            "datetime": t,
+            "DewP":   w_hr["dew_point_2m"][idx],
+            "Temp":   w_hr["temperature_2m"][idx],
+            "Press":  w_hr["pressure_msl"][idx],
+            "WindSpeed": w_hr["wind_speed_10m"][idx],
+            "WindDir":   w_hr["wind_direction_10m"][idx],
+            "Humidity":  w_hr["relative_humidity_2m"][idx],
+            "Hour":  t.hour,
+            "Month": t.month,
+            "Weekday": t.weekday(),
+        }
+        # Lag / rolling features from current history list
+        row.update(make_lag_features(history_pm25))
 
-def generate_forecast_summary(df: pd.DataFrame):
-    if df.empty:
-        return "No forecast data available."
-    worst_idx = df["pm25"].idxmax()
-    worst_time = df.loc[worst_idx, "datetime"]
-    worst_cat = df.loc[worst_idx, "aqi_category"]
+        # Predict pm25 for this hour
+        df_one = pd.DataFrame([row])
+        pred = float(model.predict(df_one)[0])
+        row["pm25_pred"] = pred
+        preds.append(pred)
+        rows.append(row)
 
-    today = datetime.date.today()
-    if worst_time.date() == today:
-        date_str = "today"
-    elif worst_time.date() == today + datetime.timedelta(days=1):
-        date_str = "tomorrow"
-    else:
-        date_str = worst_time.strftime("%A, %B %d")
+        # append pred to history for next step's lags
+        history_pm25.append(pred)
+    return pd.DataFrame(rows)
 
-    hour = worst_time.hour
-    if 6 <= hour < 12:
-        period = "morning"
-    elif 12 <= hour < 18:
-        period = "afternoon"
-    else:
-        period = "evening" if hour >= 18 else "night"
+# ------------------------------------------------------------------
+# 🖼️  UI
+# ------------------------------------------------------------------
+with st.sidebar:
+    city_name = st.text_input("City", value="Beijing")
+    go_btn = st.button("Get Pollution Forecast", type="primary")
 
-    rec = ""
-    if worst_cat in {"Unhealthy", "Very Unhealthy", "Hazardous"}:
-        rec = "\n⛔ Outdoor activity is not recommended."
-    elif worst_cat == "Unhealthy for Sensitive Groups":
-        rec = "\n⚠️ Sensitive individuals should limit outdoor activity."
-    return f"Air quality will be worst {date_str} in the {period}, reaching **{worst_cat}** levels.{rec}"
+if go_btn:
+    try:
+        lat, lon, tz, proper_city = geocode_city(city_name)
+    except Exception as e:
+        st.error(f"Geocoder error – {e}")
+        st.stop()
 
-# --------------------------------------------------
-# 🚀  MAIN APP FLOW
-# --------------------------------------------------
-if forecast_button:
-    with st.spinner("Fetching data & predicting …"):
-        weather_json = fetch_weather_forecast(city)
-        if weather_json:
-            weather_df = preprocess_weather_data(weather_json)
-            rf_model = load_model()
-            preds = predict_pm25(rf_model, weather_df)
-            if preds:
-                weather_df["pm25"] = preds
-                weather_df["aqi_category"], weather_df["aqi_color"] = zip(*weather_df["pm25"].apply(pm25_to_aqi_category))
+    with st.spinner("Fetching weather & air‑quality data …"):
+        try:
+            w_json  = fetch_weather(lat, lon, tz)
+            aq_json = fetch_pm25_history(lat, lon, tz)
+        except Exception as e:
+            st.error(f"API error – {e}")
+            st.stop()
 
-                # Tabs for overview / chart / table
-                tab_over, tab_chart, tab_table = st.tabs(["Summary", "PM2.5 Trend", "Raw data"])
+    df_future = build_future_dataframe(w_json, aq_json, tz)
 
-                with tab_over:
-                    st.markdown(generate_forecast_summary(weather_df))
+    st.subheader(f"Predicted Air Pollution Levels for {proper_city}")
+    # Chart with coloured band
+    fig, ax = plt.subplots(figsize=(10,4))
+    # colour background
+    for low, high, col in aqi_bands:
+        ax.axhspan(low, high, color=col, alpha=0.25)
+    ax.plot(df_future["datetime"], df_future["pm25_pred"], marker="o", color="black")
+    ax.set_ylabel("PM2.5 (µg/m³)")
+    ax.set_xlabel("Time")
+    ax.grid(ls="--", alpha=0.3)
+    st.pyplot(fig)
 
-                with tab_chart:
-                    fig, ax = plt.subplots(figsize=(10, 4))
-                    ax.plot(weather_df["datetime"], weather_df["pm25"], marker="o", lw=1.5)
-                    ax.set_ylabel("PM2.5 (µg/m³)")
-                    ax.set_xlabel("Time")
-                    ax.set_title("Predicted PM2.5 concentration – next 72 h")
-                    ax.grid(True, linestyle="--", alpha=0.4)
-                    st.pyplot(fig)
-
-                with tab_table:
-                    st.dataframe(weather_df.set_index("datetime"), use_container_width=True)
+    # Data tab
+    with st.expander("Detailed Data"):
+        st.dataframe(df_future[["datetime","pm25_pred"]].rename(columns={"pm25_pred":"PM2.5 µg/m³"}), use_container_width=True)
