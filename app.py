@@ -3,72 +3,80 @@ import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime as dt
-import requests, os, joblib, pytz
+import requests, os, joblib, pytz, re
 
-# ------------------------------------------------------------------
-# 📄  PAGE CONFIG
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------
 st.set_page_config(page_title="Air Pollution Forecast", page_icon="🌬️", layout="wide")
 
-st.title("Air Pollution Forecast")
+MODEL_PATH      = "rf_pm25_model.pkl"
+FORECAST_HOURS  = 72   # predict next 72 h
+HISTORY_HOURS   = 24   # hours of real pm2.5 for lag features
 
-# ------------------------------------------------------------------
-# 🔧  CONSTANTS & HELPERS
-# ------------------------------------------------------------------
-MODEL_PATH = "rf_pm25_model.pkl"  # → same folder as this file
-FORECAST_HOURS = 72              # how far ahead we predict
-HISTORY_HOURS  = 24              # pm2.5 history window for lags
+GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
+WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+AIRQUAL_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
-# -- AQI colour bands for quick chart shading
-aqi_bands = [(0,12,"#b8f4a8"), (12.1,35.4,"#ffffa1"), (35.5,55.4,"#ffd48c"),
-             (55.5,150.4,"#ff9999"), (150.5,250.4,"#c79ddf"), (250.5,500,"#a07cc8")]
+# Background AQI colour bands (µg/m³)
+aqi_bands = [
+    (0,12,"#b7f4b0"), (12.1,35.4,"#ffff9c"), (35.5,55.4,"#ffcd96"),
+    (55.5,150.4,"#ff9d9d"), (150.5,250.4,"#c99ee0"), (250.5,500,"#a285c3")
+]
 
-# ------------------------------------------------------------------
-# ☁️  OPEN‑METEO ENDPOINTS
-# ------------------------------------------------------------------
-GEOCODE_URL   = "https://geocoding-api.open-meteo.com/v1/search"
-WEATHER_URL   = "https://api.open-meteo.com/v1/forecast"
-AIRQUAL_URL   = "https://air-quality-api.open-meteo.com/v1/air-quality"
+# Map Open‑Meteo variable → column name used during model training
+WEATHER_RENAME = {
+    "temperature_2m": "Temp",
+    "dew_point_2m":  "DewP",
+    "pressure_msl":  "Press",
+    "wind_speed_10m":"WindSpeed",
+    "wind_direction_10m":"WindDir",
+    "relative_humidity_2m":"Humidity",
+}
 
-def geocode_city(city: str):
-    resp = requests.get(GEOCODE_URL, params={"name": city, "count": 1})
-    resp.raise_for_status()
-    results = resp.json().get("results")
-    if not results:
-        raise ValueError("City not found in Open‑Meteo geocoder")
-    r = results[0]
-    return r["latitude"], r["longitude"], r["timezone"], r["name"]
+# ---------------------------------------------------------------
+# API HELPERS
+# ---------------------------------------------------------------
+
+def geocode_city(city:str):
+    r = requests.get(GEOCODE_URL, params={"name":city,"count":1}, timeout=15)
+    r.raise_for_status()
+    res = r.json().get("results")
+    if not res:
+        raise ValueError("City not found")
+    d = res[0]
+    return d["latitude"], d["longitude"], d["timezone"], d["name"]
 
 
-def fetch_weather(lat, lon, timezone):
+def fetch_weather(lat, lon, tz):
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,wind_speed_10m,wind_direction_10m",
+        "latitude":lat, "longitude":lon, "timezone":tz,
+        "hourly": ",".join(WEATHER_RENAME.keys()),
         "forecast_hours": FORECAST_HOURS,
-        "timezone": timezone,
     }
     r = requests.get(WEATHER_URL, params=params, timeout=15)
     r.raise_for_status()
-    return r.json()
+    j = r.json()["hourly"]
+    df = pd.DataFrame(j).rename(columns=WEATHER_RENAME)
+    df["time"] = pd.to_datetime(df["time"])
+    return df
 
 
-def fetch_pm25_history(lat, lon, timezone):
+def fetch_pm25_history(lat, lon, tz):
     params = {
-        "latitude": lat,
-        "longitude": lon,
-        "hourly": "pm2_5",
-        "timezone": timezone,
-        "past_days": 3,         # get 72 h back (max 3)
-        "forecast_hours": FORECAST_HOURS,
+        "latitude":lat, "longitude":lon, "timezone":tz,
+        "hourly":"pm2_5", "past_days":3, "forecast_hours":FORECAST_HOURS
     }
     r = requests.get(AIRQUAL_URL, params=params, timeout=15)
     r.raise_for_status()
-    return r.json()
+    j = r.json()["hourly"]
+    df = pd.DataFrame(j)
+    df["time"] = pd.to_datetime(df["time"])
+    return df
 
-# ------------------------------------------------------------------
-# 🤖  MODEL
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------
+# MODEL & FEATURE LOGIC
+# ---------------------------------------------------------------
 @st.cache_resource(show_spinner=False)
 def load_model():
     if not os.path.exists(MODEL_PATH):
@@ -77,104 +85,93 @@ def load_model():
     return joblib.load(MODEL_PATH)
 
 model = load_model()
-pre_feat_names = list(model.named_steps["preprocessor"].feature_names_in_)
-# Which lag / roll cols does the model need?
-lag_cols  = [c for c in pre_feat_names if "lag"  in c]
-roll_cols = [c for c in pre_feat_names if "roll" in c]
+pre_feats = list(model.named_steps["preprocessor"].feature_names_in_)
+lag_cols  = [c for c in pre_feats if "lag"  in c]
+roll_cols = [c for c in pre_feats if "roll" in c]
 
-# Helpers to compute lags / rolls given history list
-def make_lag_features(history):
+
+def make_lag_features(history:list):
+    """Return a dict of {col:value} for all lag/roll cols expected by the model."""
     feats = {}
     for col in lag_cols:
-        # expect name like "pm2.5_lag1" → lag=1
-        lag = int(col.split("lag")[-1])
+        lag = int(re.findall(r"\d+", col)[0])          # works for lag1 / lag_1 / lag1h
         feats[col] = history[-lag] if len(history) >= lag else history[0]
     for col in roll_cols:
-        # expect name like "pm2.5_roll24" → window=24
-        win = int(col.split("roll")[-1])
-        feats[col] = float(np.mean(history[-win:])) if len(history) >= 1 else history[-1]
+        win = int(re.findall(r"\d+", col)[0])          # works for roll24 / roll24h
+        feats[col] = float(np.mean(history[-win:])) if history else np.nan
     return feats
 
-# ------------------------------------------------------------------
-# 🏗️  FEATURE CONSTRUCTION
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------
+# DATAFRAME BUILDER (recursive forecast)
+# ---------------------------------------------------------------
 
-def build_future_dataframe(weather_json, pm_json, tz):
-    # Weather future block
-    w_hr   = weather_json["hourly"]
-    times  = [dt.datetime.fromisoformat(t).replace(tzinfo=pytz.timezone(tz)) for t in w_hr["time"]][:FORECAST_HOURS]
-    # Past PM2.5 block (last HISTORY_HOURS)
-    aq_hr  = pm_json["hourly"]
-    past_times = [dt.datetime.fromisoformat(t).replace(tzinfo=pytz.timezone(tz)) for t in aq_hr["time"]]
-    past_vals  = aq_hr["pm2_5"]
-    # take the last HISTORY_HOURS actual values as history seed
-    history_pm25 = past_vals[-HISTORY_HOURS:]
+def build_future_dataframe(wx_df, aq_df, tz):
+    # Merge to ensure we have past PM2.5 for HISTORY_HOURS
+    aq_df = aq_df.sort_values("time")
+    history_pm = aq_df["pm2_5"].tail(HISTORY_HOURS).tolist()
 
-    rows, preds = [], []
-    for idx, t in enumerate(times):
-        # Base weather/time features
-        row = {
-            "datetime": t,
-            "DewP":   w_hr["dew_point_2m"][idx],
-            "Temp":   w_hr["temperature_2m"][idx],
-            "Press":  w_hr["pressure_msl"][idx],
-            "WindSpeed": w_hr["wind_speed_10m"][idx],
-            "WindDir":   w_hr["wind_direction_10m"][idx],
-            "Humidity":  w_hr["relative_humidity_2m"][idx],
-            "Hour":  t.hour,
-            "Month": t.month,
-            "Weekday": t.weekday(),
+    rows = []
+    for idx in range(FORECAST_HOURS):
+        row_time = wx_df.loc[idx, "time"]
+        base = {
+            "datetime": row_time,
+            "Year":  row_time.year,
+            "Month": row_time.month,
+            "Day":   row_time.day,
+            "Hour":  row_time.hour,
+            "Weekday": row_time.weekday(),
         }
-        # Lag / rolling features from current history list
-        row.update(make_lag_features(history_pm25))
+        # attach weather columns (renamed already)
+        for trg_col in WEATHER_RENAME.values():
+            base[trg_col] = wx_df.loc[idx, trg_col]
 
-        # Predict pm25 for this hour
-        df_one = pd.DataFrame([row])
-        pred = float(model.predict(df_one)[0])
-        row["pm25_pred"] = pred
-        preds.append(pred)
-        rows.append(row)
+        # add lag / rolling features
+        base.update(make_lag_features(history_pm))
 
-        # append pred to history for next step's lags
-        history_pm25.append(pred)
+        # dataframe for single prediction
+        pred_df = pd.DataFrame([base])
+        yhat = float(model.predict(pred_df)[0])
+        history_pm.append(yhat)
+        base["PM2.5_pred"] = yhat
+        rows.append(base)
     return pd.DataFrame(rows)
 
-# ------------------------------------------------------------------
-# 🖼️  UI
-# ------------------------------------------------------------------
+# ---------------------------------------------------------------
+# STREAMLIT UI
+# ---------------------------------------------------------------
 with st.sidebar:
-    city_name = st.text_input("City", value="Beijing")
-    go_btn = st.button("Get Pollution Forecast", type="primary")
+    city_inp = st.text_input("City", "Beijing")
+    if st.button("Get Pollution Forecast", type="primary"):
+        st.session_state["go"] = True
 
-if go_btn:
+if st.session_state.get("go"):
     try:
-        lat, lon, tz, proper_city = geocode_city(city_name)
+        lat, lon, tz, proper = geocode_city(city_inp)
     except Exception as e:
-        st.error(f"Geocoder error – {e}")
+        st.error(f"Geocoder error: {e}")
         st.stop()
 
-    with st.spinner("Fetching weather & air‑quality data …"):
+    with st.spinner("Fetching data …"):
         try:
-            w_json  = fetch_weather(lat, lon, tz)
+            wx_json = fetch_weather(lat, lon, tz)
             aq_json = fetch_pm25_history(lat, lon, tz)
         except Exception as e:
-            st.error(f"API error – {e}")
+            st.error(f"API error: {e}")
             st.stop()
 
-    df_future = build_future_dataframe(w_json, aq_json, tz)
+    df_future = build_future_dataframe(wx_json, aq_json, tz)
 
-    st.subheader(f"Predicted Air Pollution Levels for {proper_city}")
-    # Chart with coloured band
+    st.subheader(f"Predicted PM2.5 for {proper} – next {FORECAST_HOURS} h")
+
+    # Plot
     fig, ax = plt.subplots(figsize=(10,4))
-    # colour background
-    for low, high, col in aqi_bands:
-        ax.axhspan(low, high, color=col, alpha=0.25)
-    ax.plot(df_future["datetime"], df_future["pm25_pred"], marker="o", color="black")
+    for lo, hi, col in aqi_bands:
+        ax.axhspan(lo, hi, color=col, alpha=0.25)
+    ax.plot(df_future["datetime"], df_future["PM2.5_pred"], marker="o", color="black")
     ax.set_ylabel("PM2.5 (µg/m³)")
     ax.set_xlabel("Time")
     ax.grid(ls="--", alpha=0.3)
     st.pyplot(fig)
 
-    # Data tab
-    with st.expander("Detailed Data"):
-        st.dataframe(df_future[["datetime","pm25_pred"]].rename(columns={"pm25_pred":"PM2.5 µg/m³"}), use_container_width=True)
+    with st.expander("Detailed data"):
+        st.dataframe(df_future[["datetime","PM2.5_pred"]].rename(columns={"PM2.5_pred":"PM2.5 (µg/m³)"}), use_container_width=True)
