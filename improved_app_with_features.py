@@ -10,6 +10,9 @@ import joblib
 import re
 import pytz
 import math
+import time
+from requests.adapters import HTTPAdapter
+from requests.packages.urllib3.util.retry import Retry
 
 # Set page configuration
 st.set_page_config(
@@ -81,6 +84,33 @@ st.markdown("""
         background-color: #FF4B4B;
         color: white;
     }
+    
+    /* Error message styling */
+    .error-box {
+        background-color: #FFEBEE;
+        border-left: 5px solid #F44336;
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 4px;
+    }
+    
+    /* Warning message styling */
+    .warning-box {
+        background-color: #FFF8E1;
+        border-left: 5px solid #FFC107;
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 4px;
+    }
+    
+    /* Info message styling */
+    .info-box {
+        background-color: #E3F2FD;
+        border-left: 5px solid #2196F3;
+        padding: 15px;
+        margin: 10px 0;
+        border-radius: 4px;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -88,12 +118,17 @@ st.markdown("""
 MODEL_PATH = "rf_pm25_model.pkl"
 FORECAST_HOURS = 72  # predict next 72 h
 HISTORY_HOURS = 24   # hours of real pm2.5 for lag features
+MAX_RETRIES = 3      # maximum number of API retry attempts
+RETRY_BACKOFF = 2    # exponential backoff factor
 
 # API URLs
 GEOCODE_URL = "https://geocoding-api.open-meteo.com/v1/search"
 WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 AIRQUAL_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 HISTORICAL_WEATHER_URL = "https://archive-api.open-meteo.com/v1/archive"
+
+# Fallback data paths (for when APIs are unreachable)
+FALLBACK_DATA_DIR = "fallback_data"
 
 # Map Open‑Meteo variable → column name used during model training
 WEATHER_RENAME = {
@@ -119,80 +154,341 @@ with st.sidebar:
     
     # Forecast button
     forecast_button = st.button("Get Pollution Forecast", type="primary")
+    
+    # Add a checkbox for using fallback data (for testing or when APIs are down)
+    use_fallback = st.checkbox("Use fallback data (offline mode)", value=False, 
+                              help="Enable this if you're having issues with API connectivity")
 
 # ---------------------------------------------------------------
-# API HELPERS
+# API HELPERS WITH ERROR HANDLING
 # ---------------------------------------------------------------
 
-def geocode_city(city: str):
+def create_session_with_retries():
+    """Create a requests session with retry capabilities"""
+    session = requests.Session()
+    retry_strategy = Retry(
+        total=MAX_RETRIES,
+        backoff_factor=RETRY_BACKOFF,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=["GET"]
+    )
+    adapter = HTTPAdapter(max_retries=retry_strategy)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+def safe_api_request(url, params, timeout=15, fallback_data=None, fallback_file=None):
+    """Make an API request with error handling and fallback options"""
+    try:
+        session = create_session_with_retries()
+        r = session.get(url, params=params, timeout=timeout)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.SSLError:
+        st.warning("""
+        SSL connection error. This may be due to network restrictions in your environment.
+        
+        If you're running on Streamlit Cloud, some API connections might be restricted.
+        Try using the fallback data option or run the app locally.
+        """, icon="⚠️")
+        if fallback_data:
+            return fallback_data
+        elif fallback_file and os.path.exists(fallback_file):
+            with open(fallback_file, 'r') as f:
+                return json.load(f)
+        raise
+    except requests.exceptions.ConnectionError:
+        st.warning("""
+        Connection error. Unable to reach the API server.
+        
+        This could be due to network issues or API service unavailability.
+        Try using the fallback data option or try again later.
+        """, icon="⚠️")
+        if fallback_data:
+            return fallback_data
+        elif fallback_file and os.path.exists(fallback_file):
+            with open(fallback_file, 'r') as f:
+                return json.load(f)
+        raise
+    except requests.exceptions.Timeout:
+        st.warning("""
+        Request timed out. The API server is taking too long to respond.
+        
+        Try using the fallback data option or try again later.
+        """, icon="⚠️")
+        if fallback_data:
+            return fallback_data
+        elif fallback_file and os.path.exists(fallback_file):
+            with open(fallback_file, 'r') as f:
+                return json.load(f)
+        raise
+    except requests.exceptions.RequestException as e:
+        st.error(f"""
+        API request failed: {str(e)}
+        
+        Try using the fallback data option or try again later.
+        """, icon="🚨")
+        if fallback_data:
+            return fallback_data
+        elif fallback_file and os.path.exists(fallback_file):
+            with open(fallback_file, 'r') as f:
+                return json.load(f)
+        raise
+
+def geocode_city(city: str, use_fallback=False):
     """Get latitude, longitude, timezone, and proper name for a city"""
-    r = requests.get(GEOCODE_URL, params={"name": city, "count": 1}, timeout=15)
-    r.raise_for_status()
-    res = r.json().get("results")
-    if not res:
-        raise ValueError("City not found")
-    d = res[0]
-    return d["latitude"], d["longitude"], d["timezone"], d["name"]
+    # Fallback data for Beijing (most common use case)
+    fallback_data = {
+        "results": [{
+            "name": "Beijing",
+            "latitude": 39.9075,
+            "longitude": 116.39723,
+            "timezone": "Asia/Shanghai"
+        }]
+    }
+    
+    # If using fallback mode or if the city is Beijing, use fallback data
+    if use_fallback or city.lower() == "beijing":
+        return (fallback_data["results"][0]["latitude"], 
+                fallback_data["results"][0]["longitude"], 
+                fallback_data["results"][0]["timezone"], 
+                fallback_data["results"][0]["name"])
+    
+    # Otherwise try the API
+    fallback_file = os.path.join(FALLBACK_DATA_DIR, f"geocode_{city.lower().replace(' ', '_')}.json")
+    
+    try:
+        response = safe_api_request(
+            GEOCODE_URL, 
+            params={"name": city, "count": 1}, 
+            fallback_data=fallback_data if city.lower() == "beijing" else None,
+            fallback_file=fallback_file
+        )
+        
+        res = response.get("results")
+        if not res:
+            st.warning(f"City '{city}' not found. Using Beijing as default.", icon="⚠️")
+            return (fallback_data["results"][0]["latitude"], 
+                    fallback_data["results"][0]["longitude"], 
+                    fallback_data["results"][0]["timezone"], 
+                    fallback_data["results"][0]["name"])
+        
+        d = res[0]
+        
+        # Save this result for future fallback
+        os.makedirs(FALLBACK_DATA_DIR, exist_ok=True)
+        with open(fallback_file, 'w') as f:
+            json.dump(response, f)
+            
+        return d["latitude"], d["longitude"], d["timezone"], d["name"]
+    except Exception as e:
+        st.error(f"Error geocoding city: {str(e)}", icon="🚨")
+        return (fallback_data["results"][0]["latitude"], 
+                fallback_data["results"][0]["longitude"], 
+                fallback_data["results"][0]["timezone"], 
+                fallback_data["results"][0]["name"])
 
+def generate_datetime_range(hours, start_from_past=False):
+    """Generate a range of datetime objects with proper timezone handling"""
+    now = datetime.datetime.now().replace(minute=0, second=0, microsecond=0)
+    
+    if start_from_past:
+        # Generate datetimes from past to now
+        return [now - datetime.timedelta(hours=i) for i in range(hours, 0, -1)]
+    else:
+        # Generate datetimes from now to future
+        return [now + datetime.timedelta(hours=i) for i in range(hours)]
 
-def fetch_weather(lat, lon, tz):
+def fetch_weather(lat, lon, tz, use_fallback=False):
     """Get weather forecast data from Open-Meteo API"""
-    params = {
-        "latitude": lat, 
-        "longitude": lon, 
-        "timezone": tz,
-        "hourly": ",".join(WEATHER_RENAME.keys()),
-        "forecast_hours": FORECAST_HOURS,
+    # Create fallback data filename based on coordinates
+    fallback_file = os.path.join(FALLBACK_DATA_DIR, f"weather_{lat:.2f}_{lon:.2f}.json")
+    
+    # Generate proper datetime strings for fallback data
+    future_datetimes = generate_datetime_range(FORECAST_HOURS)
+    datetime_strings = [dt.isoformat() for dt in future_datetimes]
+    
+    # Beijing fallback data (pre-generated)
+    beijing_fallback = {
+        "hourly": {
+            "time": datetime_strings,
+            "temperature_2m": [np.random.normal(25, 5) for _ in range(FORECAST_HOURS)],
+            "dew_point_2m": [np.random.normal(15, 3) for _ in range(FORECAST_HOURS)],
+            "pressure_msl": [np.random.normal(1013, 5) for _ in range(FORECAST_HOURS)],
+            "wind_speed_10m": [np.random.normal(10, 5) for _ in range(FORECAST_HOURS)],
+            "wind_direction_10m": [np.random.randint(0, 360) for _ in range(FORECAST_HOURS)],
+            "relative_humidity_2m": [np.random.normal(60, 10) for _ in range(FORECAST_HOURS)],
+            "precipitation": [max(0, np.random.normal(0, 0.5)) for _ in range(FORECAST_HOURS)],
+            "snowfall": [max(0, np.random.normal(0, 0.1)) for _ in range(FORECAST_HOURS)]
+        }
     }
-    r = requests.get(WEATHER_URL, params=params, timeout=15)
-    r.raise_for_status()
-    j = r.json()["hourly"]
-    df = pd.DataFrame(j).rename(columns=WEATHER_RENAME)
-    df["time"] = pd.to_datetime(df["time"])
-    return df
+    
+    if use_fallback:
+        # Use the fallback data directly
+        df = pd.DataFrame(beijing_fallback["hourly"]).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+    
+    try:
+        params = {
+            "latitude": lat, 
+            "longitude": lon, 
+            "timezone": tz,
+            "hourly": ",".join(WEATHER_RENAME.keys()),
+            "forecast_hours": FORECAST_HOURS,
+        }
+        
+        response = safe_api_request(
+            WEATHER_URL, 
+            params=params, 
+            fallback_file=fallback_file
+        )
+        
+        # Save this result for future fallback
+        os.makedirs(FALLBACK_DATA_DIR, exist_ok=True)
+        with open(fallback_file, 'w') as f:
+            json.dump(response, f)
+        
+        j = response["hourly"]
+        df = pd.DataFrame(j).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+    except Exception as e:
+        st.warning(f"Error fetching weather data: {str(e)}. Using simulated data.", icon="⚠️")
+        
+        # Use the fallback data
+        df = pd.DataFrame(beijing_fallback["hourly"]).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
 
-
-def fetch_historical_weather(lat, lon, tz):
+def fetch_historical_weather(lat, lon, tz, use_fallback=False):
     """Get historical weather data from Open-Meteo Archive API"""
-    # Calculate date range for historical data (3 days back)
-    end_date = datetime.datetime.now().strftime("%Y-%m-%d")
-    start_date = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+    # Create fallback data filename based on coordinates
+    fallback_file = os.path.join(FALLBACK_DATA_DIR, f"historical_weather_{lat:.2f}_{lon:.2f}.json")
     
-    params = {
-        "latitude": lat,
-        "longitude": lon,
-        "start_date": start_date,
-        "end_date": end_date,
-        "timezone": tz,
-        "hourly": ",".join(WEATHER_RENAME.keys())
+    # Generate proper datetime strings for fallback data
+    past_datetimes = generate_datetime_range(72, start_from_past=True)
+    datetime_strings = [dt.isoformat() for dt in past_datetimes]
+    
+    # Beijing fallback data (pre-generated)
+    beijing_fallback = {
+        "hourly": {
+            "time": datetime_strings,
+            "temperature_2m": [np.random.normal(25, 5) for _ in range(72)],
+            "dew_point_2m": [np.random.normal(15, 3) for _ in range(72)],
+            "pressure_msl": [np.random.normal(1013, 5) for _ in range(72)],
+            "wind_speed_10m": [np.random.normal(10, 5) for _ in range(72)],
+            "wind_direction_10m": [np.random.randint(0, 360) for _ in range(72)],
+            "relative_humidity_2m": [np.random.normal(60, 10) for _ in range(72)],
+            "precipitation": [max(0, np.random.normal(0, 0.5)) for _ in range(72)],
+            "snowfall": [max(0, np.random.normal(0, 0.1)) for _ in range(72)]
+        }
     }
     
-    r = requests.get(HISTORICAL_WEATHER_URL, params=params, timeout=15)
-    r.raise_for_status()
-    j = r.json()["hourly"]
-    df = pd.DataFrame(j).rename(columns=WEATHER_RENAME)
-    df["time"] = pd.to_datetime(df["time"])
-    return df
+    if use_fallback:
+        # Use the fallback data directly
+        df = pd.DataFrame(beijing_fallback["hourly"]).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+    
+    try:
+        # Calculate date range for historical data (3 days back)
+        end_date = datetime.datetime.now().strftime("%Y-%m-%d")
+        start_date = (datetime.datetime.now() - datetime.timedelta(days=3)).strftime("%Y-%m-%d")
+        
+        params = {
+            "latitude": lat,
+            "longitude": lon,
+            "start_date": start_date,
+            "end_date": end_date,
+            "timezone": tz,
+            "hourly": ",".join(WEATHER_RENAME.keys())
+        }
+        
+        response = safe_api_request(
+            HISTORICAL_WEATHER_URL, 
+            params=params, 
+            fallback_file=fallback_file
+        )
+        
+        # Save this result for future fallback
+        os.makedirs(FALLBACK_DATA_DIR, exist_ok=True)
+        with open(fallback_file, 'w') as f:
+            json.dump(response, f)
+        
+        j = response["hourly"]
+        df = pd.DataFrame(j).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
+    except Exception as e:
+        st.warning(f"Error fetching historical weather data: {str(e)}. Using simulated data.", icon="⚠️")
+        
+        # Use the fallback data
+        df = pd.DataFrame(beijing_fallback["hourly"]).rename(columns=WEATHER_RENAME)
+        df["time"] = pd.to_datetime(df["time"])
+        return df
 
-
-def fetch_pm25_history(lat, lon, tz):
+def fetch_pm25_history(lat, lon, tz, use_fallback=False):
     """Get historical PM2.5 data from Open-Meteo Air Quality API"""
-    params = {
-        "latitude": lat, 
-        "longitude": lon, 
-        "timezone": tz,
-        "hourly": "pm2_5", 
-        "past_days": 3, 
-        "forecast_hours": 0  # We only need historical data
+    # Create fallback data filename based on coordinates
+    fallback_file = os.path.join(FALLBACK_DATA_DIR, f"pm25_history_{lat:.2f}_{lon:.2f}.json")
+    
+    # Generate proper datetime strings for fallback data
+    past_datetimes = generate_datetime_range(72, start_from_past=True)
+    datetime_strings = [dt.isoformat() for dt in past_datetimes]
+    
+    # Beijing fallback data (pre-generated)
+    beijing_fallback = {
+        "hourly": {
+            "time": datetime_strings,
+            "pm2_5": [max(5, np.random.normal(50, 20)) for _ in range(72)]
+        }
     }
-    r = requests.get(AIRQUAL_URL, params=params, timeout=15)
-    r.raise_for_status()
-    j = r.json()["hourly"]
-    df = pd.DataFrame(j)
-    df["time"] = pd.to_datetime(df["time"])
-    # Rename pm2_5 to pm2.5 to match model training column name
-    df = df.rename(columns={"pm2_5": "pm2.5"})
-    return df
+    
+    if use_fallback:
+        # Use the fallback data directly
+        df = pd.DataFrame(beijing_fallback["hourly"])
+        df["time"] = pd.to_datetime(df["time"])
+        # Rename pm2_5 to pm2.5 to match model training column name
+        df = df.rename(columns={"pm2_5": "pm2.5"})
+        return df
+    
+    try:
+        params = {
+            "latitude": lat, 
+            "longitude": lon, 
+            "timezone": tz,
+            "hourly": "pm2_5", 
+            "past_days": 3, 
+            "forecast_hours": 0  # We only need historical data
+        }
+        
+        response = safe_api_request(
+            AIRQUAL_URL, 
+            params=params, 
+            fallback_file=fallback_file
+        )
+        
+        # Save this result for future fallback
+        os.makedirs(FALLBACK_DATA_DIR, exist_ok=True)
+        with open(fallback_file, 'w') as f:
+            json.dump(response, f)
+        
+        j = response["hourly"]
+        df = pd.DataFrame(j)
+        df["time"] = pd.to_datetime(df["time"])
+        # Rename pm2_5 to pm2.5 to match model training column name
+        df = df.rename(columns={"pm2_5": "pm2.5"})
+        return df
+    except Exception as e:
+        st.warning(f"Error fetching PM2.5 history: {str(e)}. Using simulated data.", icon="⚠️")
+        
+        # Use the fallback data
+        df = pd.DataFrame(beijing_fallback["hourly"])
+        df["time"] = pd.to_datetime(df["time"])
+        # Rename pm2_5 to pm2.5 to match model training column name
+        df = df.rename(columns={"pm2_5": "pm2.5"})
+        return df
 
 # ---------------------------------------------------------------
 # MODEL & FEATURE LOGIC
@@ -203,7 +499,11 @@ def load_model():
     if not os.path.exists(MODEL_PATH):
         st.error("Model file not found – upload rf_pm25_model.pkl")
         st.stop()
-    return joblib.load(MODEL_PATH)
+    try:
+        return joblib.load(MODEL_PATH)
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        st.stop()
 
 def get_season(month):
     """Determine season from month number"""
@@ -300,6 +600,10 @@ def add_time_features(df):
     """Add time-based features to the dataframe"""
     # Create a copy of the dataframe
     result_df = df.copy()
+    
+    # Ensure time column is datetime
+    if not pd.api.types.is_datetime64_any_dtype(result_df["time"]):
+        result_df["time"] = pd.to_datetime(result_df["time"])
     
     # Extract datetime components
     result_df["Year"] = result_df["time"].dt.year
@@ -422,74 +726,94 @@ def build_future_dataframe(wx_df, aq_df, historical_weather_df=None):
     history_pm25 = aq_df["pm2.5"].tail(HISTORY_HOURS).tolist()
     
     # Load the model
-    model = load_model()
+    try:
+        model = load_model()
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}")
+        st.stop()
     
     rows = []
     for idx in range(FORECAST_HOURS):
-        # For the first prediction, use the prepared features
-        if idx == 0:
-            # Prepare features for the first time step
-            pred_df = prepare_features(wx_df.iloc[[idx]], aq_df, historical_weather_df)
-            
-            # Debug info
-            st.write("Debug info - Features available:")
-            st.write(pred_df.columns.tolist())
-            
-            # Make prediction
-            try:
-                yhat = float(model.predict(pred_df)[0])
-            except Exception as e:
-                st.error(f"Prediction error: {e}")
-                st.stop()
+        try:
+            # For the first prediction, use the prepared features
+            if idx == 0:
+                # Prepare features for the first time step
+                pred_df = prepare_features(wx_df.iloc[[idx]], aq_df, historical_weather_df)
                 
-            # Add prediction to history for next iteration
-            history_pm25.append(yhat)
-            
-            # Add prediction to result
-            pred_df["PM2.5_pred"] = yhat
-            rows.append(pred_df.iloc[0].to_dict())
-        else:
-            # For subsequent predictions, update the features with the latest prediction
-            row_time = wx_df.iloc[idx]["time"]
-            
-            # Create a new dataframe for this time step
-            new_row_df = pd.DataFrame({"time": [row_time]})
-            
-            # Add weather variables
-            for col in WEATHER_RENAME.values():
-                if col in wx_df.columns:
-                    new_row_df[col] = wx_df.iloc[idx][col]
-            
-            # Add time features
-            new_row_df = add_time_features(new_row_df)
-            
-            # Add weather features (without historical data for simplicity)
-            new_row_df = add_weather_features(new_row_df)
-            
-            # Add PM2.5 lag features using updated history
-            new_row_df = create_lag_features(new_row_df, history_pm25)
-            
-            # Add PM2.5 rolling features using updated history
-            new_row_df = create_rolling_features(new_row_df, history_pm25)
-            
-            # Add extreme event features using updated history
-            new_row_df = add_extreme_event_features(new_row_df, history_pm25)
-            
-            # Make prediction
-            try:
-                yhat = float(model.predict(new_row_df)[0])
-            except Exception as e:
-                st.error(f"Prediction error at step {idx}: {e}")
-                st.write("Debug info - Features available:")
-                st.write(new_row_df.columns.tolist())
-                st.stop()
+                # Make prediction
+                try:
+                    yhat = float(model.predict(pred_df)[0])
+                except Exception as e:
+                    st.error(f"Prediction error: {e}")
+                    # Show the features that were available
+                    st.write("Features available:")
+                    st.write(pred_df.columns.tolist())
+                    # Show the features that the model expects
+                    try:
+                        st.write("Features expected by model:")
+                        if hasattr(model, 'feature_names_in_'):
+                            st.write(model.feature_names_in_.tolist())
+                        elif hasattr(model, 'named_steps') and 'preprocessor' in model.named_steps:
+                            st.write(model.named_steps['preprocessor'].feature_names_in_.tolist())
+                    except:
+                        pass
+                    st.stop()
+                    
+                # Add prediction to history for next iteration
+                history_pm25.append(yhat)
                 
-            # Add prediction to history for next iteration
-            history_pm25.append(yhat)
-            
-            # Add prediction to result
-            new_row_df["PM2.5_pred"] = yhat
-            rows.append(new_row_df.iloc[0].to_dict())
+                # Add prediction to result
+                pred_df["PM2.5_pred"] = yhat
+                rows.append(pred_df.iloc[0].to_dict())
+            else:
+                # For subsequent predictions, update the features with the latest prediction
+                row_time = wx_df.iloc[idx]["time"]
+                
+                # Create a new dataframe for this time step
+                new_row_df = pd.DataFrame({"time": [row_time]})
+                
+                # Add weather variables
+                for col in WEATHER_RENAME.values():
+                    if col in wx_df.columns:
+                        new_row_df[col] = wx_df.iloc[idx][col]
+                
+                # Add time features
+                new_row_df = add_time_features(new_row_df)
+                
+                # Add weather features (without historical data for simplicity)
+                new_row_df = add_weather_features(new_row_df)
+                
+                # Add PM2.5 lag features using updated history
+                new_row_df = create_lag_features(new_row_df, history_pm25)
+                
+                # Add PM2.5 rolling features using updated history
+                new_row_df = create_rolling_features(new_row_df, history_pm25)
+                
+                # Add extreme event features using updated history
+                new_row_df = add_extreme_event_features(new_row_df, history_pm25)
+                
+                # Make prediction
+                try:
+                    yhat = float(model.predict(new_row_df)[0])
+                except Exception as e:
+                    st.error(f"Prediction error at step {idx}: {e}")
+                    st.write("Features available:")
+                    st.write(new_row_df.columns.tolist())
+                    st.stop()
+                    
+                # Add prediction to history for next iteration
+                history_pm25.append(yhat)
+                
+                # Add prediction to result
+                new_row_df["PM2.5_pred"] = yhat
+                rows.append(new_row_df.iloc[0].to_dict())
+        except Exception as e:
+            st.error(f"Error in prediction step {idx}: {str(e)}")
+            # If we have at least one prediction, return what we have
+            if rows:
+                break
+            else:
+                st.stop()
     
     return pd.DataFrame(rows)
 
@@ -515,51 +839,68 @@ def generate_forecast_summary(df_future):
     if df_future.empty:
         return "No forecast data available."
     
-    # Add AQI categories
-    df_future["aqi_category"], df_future["aqi_color"] = zip(*df_future["PM2.5_pred"].apply(pm25_to_aqi_category))
-    
-    # Find the worst AQI category overall
-    overall_worst_idx = df_future["PM2.5_pred"].idxmax()
-    overall_worst_category = df_future.loc[overall_worst_idx, "aqi_category"]
-    worst_time = df_future.loc[overall_worst_idx, "datetime"]
-    
-    # Format the date and time
-    date_str = "Today" if worst_time.date() == datetime.datetime.now().date() else (
-        "Tomorrow" if worst_time.date() == (datetime.datetime.now() + datetime.timedelta(days=1)).date() else
-        worst_time.strftime("%A, %B %d")
-    )
-    
-    # Format time period
-    hour = worst_time.hour
-    if 6 <= hour < 12:
-        period = "morning (6-12 AM)"
-    elif 12 <= hour < 18:
-        period = "afternoon (12-6 PM)"
-    else:
-        period = "evening (6-12 PM)" if hour >= 18 else "night (12-6 AM)"
-    
-    # Create a single sentence summary
-    summary = [f"Air quality will be worst on {date_str} during {period}, reaching {overall_worst_category} levels."]
-    
-    # Add health recommendation
-    if overall_worst_category in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
-        summary.append("\n⛔ Outdoor activity is not recommended.")
-    elif overall_worst_category == "Unhealthy for Sensitive Groups":
-        summary.append("\n⚠️ Sensitive individuals should limit outdoor activity.")
-    
-    return "\n\n".join(summary)
+    try:
+        # Add AQI categories
+        df_future["aqi_category"], df_future["aqi_color"] = zip(*df_future["PM2.5_pred"].apply(pm25_to_aqi_category))
+        
+        # Find the worst AQI category overall
+        overall_worst_idx = df_future["PM2.5_pred"].idxmax()
+        overall_worst_category = df_future.loc[overall_worst_idx, "aqi_category"]
+        worst_time = df_future.loc[overall_worst_idx, "datetime"]
+        
+        # Ensure worst_time is a valid datetime
+        if pd.isna(worst_time) or not isinstance(worst_time, (datetime.datetime, pd.Timestamp)):
+            worst_time = datetime.datetime.now() + datetime.timedelta(hours=12)  # Default to 12 hours from now
+        
+        # Format the date and time
+        try:
+            date_str = "Today" if worst_time.date() == datetime.datetime.now().date() else (
+                "Tomorrow" if worst_time.date() == (datetime.datetime.now() + datetime.timedelta(days=1)).date() else
+                worst_time.strftime("%A, %B %d")
+            )
+            
+            # Format time period
+            hour = worst_time.hour
+            if 6 <= hour < 12:
+                period = "morning (6-12 AM)"
+            elif 12 <= hour < 18:
+                period = "afternoon (12-6 PM)"
+            else:
+                period = "evening (6-12 PM)" if hour >= 18 else "night (12-6 AM)"
+        except Exception as e:
+            # Fallback if datetime formatting fails
+            date_str = "the forecast period"
+            period = "peak hours"
+            st.warning(f"Error formatting datetime: {str(e)}")
+        
+        # Create a single sentence summary
+        summary = [f"Air quality will be worst on {date_str} during {period}, reaching {overall_worst_category} levels."]
+        
+        # Add health recommendation
+        if overall_worst_category in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
+            summary.append("\n⛔ Outdoor activity is not recommended.")
+        elif overall_worst_category == "Unhealthy for Sensitive Groups":
+            summary.append("\n⚠️ Sensitive individuals should limit outdoor activity.")
+        
+        return "\n\n".join(summary)
+    except Exception as e:
+        st.error(f"Error generating forecast summary: {str(e)}")
+        return "Forecast summary unavailable due to an error."
 
 # Main app logic
 if forecast_button:
     with st.spinner("Fetching weather data and generating forecast..."):
         try:
+            # Create fallback data directory if it doesn't exist
+            os.makedirs(FALLBACK_DATA_DIR, exist_ok=True)
+            
             # Get city coordinates
-            lat, lon, tz, proper_name = geocode_city(city)
+            lat, lon, tz, proper_name = geocode_city(city, use_fallback=use_fallback)
             
             # Fetch weather, historical weather, and air quality data
-            wx_df = fetch_weather(lat, lon, tz)
-            historical_weather_df = fetch_historical_weather(lat, lon, tz)
-            aq_df = fetch_pm25_history(lat, lon, tz)
+            wx_df = fetch_weather(lat, lon, tz, use_fallback=use_fallback)
+            historical_weather_df = fetch_historical_weather(lat, lon, tz, use_fallback=use_fallback)
+            aq_df = fetch_pm25_history(lat, lon, tz, use_fallback=use_fallback)
             
             # Build forecast dataframe
             df_future = build_future_dataframe(wx_df, aq_df, historical_weather_df)
@@ -611,35 +952,39 @@ if forecast_button:
                 with tabs[1]:
                     st.subheader(f"PM2.5 Forecast for {proper_name} - Next {FORECAST_HOURS} Hours")
                     
-                    # Create figure with AQI color bands
-                    fig, ax = plt.subplots(figsize=(10, 5))
-                    
-                    # Add AQI color bands
-                    aqi_bands = [
-                        (0, 12, "#00e400"),
-                        (12.1, 35.4, "#ffff00"),
-                        (35.5, 55.4, "#ff7e00"),
-                        (55.5, 150.4, "#ff0000"),
-                        (150.5, 250.4, "#8f3f97"),
-                        (250.5, 500, "#7e0023")
-                    ]
-                    
-                    for lo, hi, col in aqi_bands:
-                        ax.axhspan(lo, hi, color=col, alpha=0.25)
-                    
-                    # Plot PM2.5 predictions
-                    ax.plot(df_future["datetime"], df_future["PM2.5_pred"], marker="o", color="black", linewidth=2)
-                    
-                    # Add labels and grid
-                    ax.set_ylabel("PM2.5 (µg/m³)")
-                    ax.set_xlabel("Time")
-                    ax.grid(ls="--", alpha=0.3)
-                    
-                    # Format x-axis to show date and time
-                    fig.autofmt_xdate()
-                    
-                    # Show the plot
-                    st.pyplot(fig)
+                    try:
+                        # Create figure with AQI color bands
+                        fig, ax = plt.subplots(figsize=(10, 5))
+                        
+                        # Add AQI color bands
+                        aqi_bands = [
+                            (0, 12, "#00e400"),
+                            (12.1, 35.4, "#ffff00"),
+                            (35.5, 55.4, "#ff7e00"),
+                            (55.5, 150.4, "#ff0000"),
+                            (150.5, 250.4, "#8f3f97"),
+                            (250.5, 500, "#7e0023")
+                        ]
+                        
+                        for lo, hi, col in aqi_bands:
+                            ax.axhspan(lo, hi, color=col, alpha=0.25)
+                        
+                        # Plot PM2.5 predictions
+                        ax.plot(df_future["datetime"], df_future["PM2.5_pred"], marker="o", color="black", linewidth=2)
+                        
+                        # Add labels and grid
+                        ax.set_ylabel("PM2.5 (µg/m³)")
+                        ax.set_xlabel("Time")
+                        ax.grid(ls="--", alpha=0.3)
+                        
+                        # Format x-axis to show date and time
+                        fig.autofmt_xdate()
+                        
+                        # Show the plot
+                        st.pyplot(fig)
+                    except Exception as e:
+                        st.error(f"Error generating chart: {str(e)}")
+                        st.write("Unable to display chart due to an error with the data.")
                     
                     # Add AQI legend
                     st.markdown("### Air Quality Index (AQI) Categories")
@@ -663,23 +1008,59 @@ if forecast_button:
                 with tabs[2]:
                     st.subheader(f"Detailed PM2.5 Forecast Data for {proper_name}")
                     
-                    # Create a copy with formatted datetime and PM2.5 values
-                    detailed_df = df_future[["datetime", "PM2.5_pred"]].copy()
-                    detailed_df = detailed_df.rename(columns={"PM2.5_pred": "PM2.5 (µg/m³)"})
+                    try:
+                        # Create a copy with formatted datetime and PM2.5 values
+                        detailed_df = df_future[["datetime", "PM2.5_pred"]].copy()
+                        detailed_df = detailed_df.rename(columns={"PM2.5_pred": "PM2.5 (µg/m³)"})
+                        
+                        # Format PM2.5 values to one decimal place
+                        detailed_df["PM2.5 (µg/m³)"] = detailed_df["PM2.5 (µg/m³)"].apply(lambda x: f"{x:.1f}")
+                        
+                        # Add AQI category
+                        detailed_df["AQI Category"] = [pm25_to_aqi_category(float(pm25))[0] for pm25 in detailed_df["PM2.5 (µg/m³)"]]
+                        
+                        # Display the detailed data
+                        st.dataframe(detailed_df, hide_index=True)
+                    except Exception as e:
+                        st.error(f"Error displaying detailed data: {str(e)}")
+                        st.write("Unable to display detailed data due to an error.")
                     
-                    # Format PM2.5 values to one decimal place
-                    detailed_df["PM2.5 (µg/m³)"] = detailed_df["PM2.5 (µg/m³)"].apply(lambda x: f"{x:.1f}")
-                    
-                    # Add AQI category
-                    detailed_df["AQI Category"] = [pm25_to_aqi_category(float(pm25))[0] for pm25 in detailed_df["PM2.5 (µg/m³)"]]
-                    
-                    # Display the detailed data
-                    st.dataframe(detailed_df, hide_index=True)
+                # Add note about fallback data if used
+                if use_fallback:
+                    st.info("""
+                    **Note:** This forecast is using fallback data since you selected offline mode.
+                    For real forecasts, disable the "Use fallback data" option in the sidebar.
+                    """, icon="ℹ️")
             else:
                 st.error("Failed to generate forecast data.")
         except Exception as e:
-            st.error(f"Error: {e}")
+            st.error(f"""
+            Error generating forecast: {str(e)}
+            
+            If you're running this app on Streamlit Cloud and experiencing API connectivity issues,
+            try enabling the "Use fallback data" option in the sidebar.
+            """, icon="🚨")
 
-# Footer
+# Footer with deployment information
 st.markdown("---")
-st.markdown("Air Pollution Forecast App - Using Random Forest Model")
+st.markdown("""
+<div style="display: flex; justify-content: space-between; align-items: center;">
+    <div>Air Pollution Forecast App - Using Random Forest Model</div>
+    <div style="text-align: right; font-size: 0.8em;">
+        <span style="color: #888;">Running on: {}</span>
+    </div>
+</div>
+""".format("Streamlit Cloud" if "STREAMLIT_SHARING" in os.environ else "Local Machine"), unsafe_allow_html=True)
+
+# Add information about offline mode
+with st.sidebar:
+    st.markdown("---")
+    st.markdown("""
+    ### About Offline Mode
+    
+    If you're experiencing API connectivity issues (especially on Streamlit Cloud),
+    enable the "Use fallback data" option above.
+    
+    This will use pre-generated data instead of making API calls,
+    allowing the app to function without external dependencies.
+    """)
