@@ -36,10 +36,14 @@ try:
     
     # Use specific version of joblib to match scikit-learn 1.6.1
     import joblib
-    model = joblib.load(model_path)
-    st.success("Model loaded successfully!")
+    try:
+        model = joblib.load(model_path)
+        st.success("Model loaded successfully!")
+    except Exception as e:
+        st.error(f"Error loading model: {str(e)}\n\nThis might be due to a version mismatch between scikit-learn and the saved model.\nPlease ensure you're using scikit-learn version 1.6.1.")
+        st.stop()
 except Exception as e:
-    st.error(f"Error loading model: {str(e)}")
+    st.error(f"Error during initialization: {str(e)}")
     st.stop()
 
 # ---------------------------------------------------------------
