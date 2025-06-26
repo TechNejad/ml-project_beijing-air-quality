@@ -6,7 +6,16 @@ import datetime as dt
 import requests
 import joblib
 import pytz
-from sklearn.preprocessing import LabelEncoder
+
+try:
+    from sklearn.preprocessing import LabelEncoder
+    from sklearn.pipeline import Pipeline
+    from sklearn.compose import ColumnTransformer
+    from sklearn.preprocessing import StandardScaler, OneHotEncoder
+    from sklearn.impute import SimpleImputer
+except ImportError as e:
+    st.error(f"Error importing scikit-learn: {str(e)}\n\nPlease ensure scikit-learn is installed correctly.")
+    st.stop()
 
 # ---------------------------------------------------------------
 # CONFIG
