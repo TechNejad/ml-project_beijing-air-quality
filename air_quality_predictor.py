@@ -28,7 +28,16 @@ WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
 
 # Load model
 try:
-    model = joblib.load(MODEL_PATH)
+    import os
+    model_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), MODEL_PATH)
+    if not os.path.exists(model_path):
+        st.error(f"Model file not found at {model_path}. Please ensure the model file is in the correct location.")
+        st.stop()
+    
+    # Use specific version of joblib to match scikit-learn 1.6.1
+    import joblib
+    model = joblib.load(model_path)
+    st.success("Model loaded successfully!")
 except Exception as e:
     st.error(f"Error loading model: {str(e)}")
     st.stop()
