@@ -98,16 +98,23 @@ with st.sidebar:
 # Load the trained model
 @st.cache_resource
 def load_model():
+    model_path = Path(__file__).parent / 'rf_pm25_model.pkl'
+    if not model_path.exists():
+        raise FileNotFoundError(
+            "Model file 'rf_pm25_model.pkl' not found. "
+            "Please ensure the model file is in the same directory as this script."
+        )
+    
+    # Try loading with joblib first
     try:
-        model_path = Path(__file__).parent / 'rf_pm25_model.pkl'
-        if not model_path.exists():
-            st.error("Model file not found. Please ensure 'rf_pm25_model.pkl' is in the same directory as this script.")
-            return None
         return joblib.load(model_path)
     except Exception as e:
-        st.error(f"Error loading the model: {str(e)}")
-        return None
+        st.warning(f"Joblib load failed, trying pickle with specific encoding: {e}")
+        import pickle
+        with open(model_path, 'rb') as f:
+            return pickle.load(f, encoding='latin1')
 
+# Load model
 model = load_model()
 
 # Function to fetch weather forecast data
@@ -272,19 +279,37 @@ def preprocess_weather_data(weather_data):
         st.error(f"Error processing weather data: {e}")
         return pd.DataFrame()
 
-def predict_pm25(model, weather_df):
-    """Use the trained model to predict PM2.5 values"""
-    if model is None:
-        st.error("Model not loaded. Cannot make predictions.")
-        return None
+def predict_pm25(weather_df):
+    """
+    Predict PM2.5 values using the trained model.
     
-    try:
-        # Make predictions
-        predictions = model.predict(weather_df)
-        return predictions
-    except Exception as e:
-        st.error(f"Error making predictions: {e}")
-        return None
+    Args:
+        weather_df: DataFrame containing weather features
+        
+    Returns:
+        Array of predicted PM2.5 values
+    """
+    # Required features for the model
+    required_features = [
+        'DewP', 'Temp', 'Press', 'WindSpeed', 'HoursOfSnow', 'HoursOfRain',
+        'WindSpeed_Winsorized', 'HoursOfRain_rolling', 'HoursOfSnow_rolling',
+        'WinDir_U', 'WinDir_V', 'day_of_week', 'day_of_year', 'is_weekend',
+        'pm2.5_lag1', 'pm2.5_lag2', 'pm2.5_lag3', 'pm2.5_lag6', 'pm2.5_lag12',
+        'pm2.5_lag24', 'pm2.5_roll24_mean', 'pm2.5_roll24_std', 'month', 'hour',
+        'Extreme_PM2.5', 'time_of_day', 'Season', 'Extreme_Event_VMD_shift1'
+    ]
+    
+    # Check for missing features
+    missing_features = [feat for feat in required_features if feat not in weather_df.columns]
+    if missing_features:
+        raise ValueError(f"Missing required features: {', '.join(missing_features)}")
+    
+    # Select only the required features in the correct order
+    X = weather_df[required_features]
+    
+    # Make predictions
+    predictions = model.predict(X)
+    return predictions
 
 def pm25_to_aqi_category(pm25):
     """Convert PM2.5 concentration to AQI category"""
@@ -341,18 +366,37 @@ def generate_forecast_summary(weather_df, pm25_predictions):
     return summary
 
 # Main app logic
-if forecast_button and model is not None:
+if forecast_button:
     with st.spinner("Fetching weather data and generating forecast..."):
-        # Fetch weather data
-        weather_data = fetch_weather_forecast(city)
-        
-        if weather_data:
+        try:
+            # Fetch weather data
+            weather_data = fetch_weather_forecast(city)
+            if not weather_data:
+                st.error("Failed to fetch weather data. Please try again later.")
+                st.stop()
+            
             # Preprocess weather data
             weather_df = preprocess_weather_data(weather_data)
+            if weather_df.empty:
+                st.error("Failed to process weather data. Please check the input data format.")
+                st.stop()
             
-            if not weather_df.empty:
-                # Predict PM2.5 values
-                pm25_predictions = predict_pm25(model, weather_df)
+            # Ensure we have all required historical PM2.5 data
+            required_pm25_columns = [
+                'pm2.5_lag1', 'pm2.5_lag2', 'pm2.5_lag3', 'pm2.5_lag6', 
+                'pm2.5_lag12', 'pm2.5_lag24', 'pm2.5_roll24_mean', 'pm2.5_roll24_std'
+            ]
+            
+            missing_pm25 = [col for col in required_pm25_columns if col not in weather_df.columns]
+            if missing_pm25:
+                st.error(
+                    f"Missing required historical PM2.5 data: {', '.join(missing_pm25)}. "
+                    "Please ensure historical PM2.5 data is available for accurate predictions."
+                )
+                st.stop()
+            
+            # Predict PM2.5 values
+            pm25_predictions = predict_pm25(weather_df)
                 
                 if pm25_predictions is not None:
                     # Create tabs for different views
