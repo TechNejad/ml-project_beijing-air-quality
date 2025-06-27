@@ -276,19 +276,16 @@ def generate_forecast_summary(forecast_df):
     worst_time = forecast_df.loc[forecast_df['pm2.5_prediction'].idxmax(), 'datetime']
     avg_pm25 = forecast_df['pm2.5_prediction'].mean()
     
-    summary = f"""
-    ## Forecast Summary
+    summary = f"""    ## Forecast Summary
     - **Worst Air Quality**: {worst_aqi} (PM2.5: {max_pm25:.1f} µg/m³)
     - **Time of Worst Air Quality**: {worst_time.strftime('%Y-%m-%d %H:%M')}
     - **Average PM2.5**: {avg_pm25:.1f} µg/m³
     """
     
     if worst_aqi in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
-        summary += "
-**⚠️ Health Advisory**: Consider limiting outdoor activities."
+        summary += "\n**⚠️ Health Advisory**: Consider limiting outdoor activities."
     elif worst_aqi == "Unhealthy for Sensitive Groups":
-        summary += "
-**ℹ️ Note**: Sensitive individuals may experience health effects."
+        summary += "\n**ℹ️ Note**: Sensitive individuals may experience health effects."
     
     return summary
 
