@@ -1,3 +1,5 @@
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -27,25 +29,48 @@ st.title("Air Pollution Forecast")
 
 with st.sidebar:
     st.header("Settings")
-    city = st.text_input("Enter any city", value="Beijing")
+    
+    # List of default cities
+    default_cities = ["Beijing", "Shanghai", "Guangzhou", "Shenzhen", "Chengdu", "Tianjin", "Wuhan", "Xian", "Hangzhou", "Nanjing"]
+    
+    city = st.selectbox("Select a city", default_cities)
+    
+    st.info("Select from the list or type a city name if running locally.")
+
     forecast_button = st.button("Get Pollution Forecast", type="primary")
 
 def get_city_coords(city_name):
-    """Get latitude and longitude for a city using Nominatim API."""
+    city_coordinates = {
+        "beijing": {"lat": 39.9042, "lon": 116.4074},
+        "shanghai": {"lat": 31.2304, "lon": 121.4737},
+        "guangzhou": {"lat": 23.1291, "lon": 113.2644},
+        "shenzhen": {"lat": 22.5431, "lon": 114.0579},
+        "chengdu": {"lat": 30.5728, "lon": 104.0668},
+        "tianjin": {"lat": 39.3434, "lon": 117.3616},
+        "wuhan": {"lat": 30.5928, "lon": 114.3055},
+        "xian": {"lat": 34.3416, "lon": 108.9398},
+        "hangzhou": {"lat": 30.2741, "lon": 120.1551},
+        "nanjing": {"lat": 32.0603, "lon": 118.7969}
+    }
+    city_key = city_name.lower().replace(" ", "")
+    if city_key in city_coordinates:
+        return city_coordinates[city_key]["lat"], city_coordinates[city_key]["lon"]
+    
     try:
         url = f"https://nominatim.openstreetmap.org/search?q={city_name}&format=json&limit=1"
-        headers = {'User-Agent': 'Mozilla/5.0'} # Nominatim requires a user-agent
+        headers = {'User-Agent': 'Mozilla/5.0'}
         response = requests.get(url, headers=headers)
         response.raise_for_status()
         data = response.json()
         if data:
             return float(data[0]['lat']), float(data[0]['lon'])
-        else:
-            st.error(f"Could not find coordinates for city: {city_name}")
-            return None, None
+    except requests.exceptions.ConnectionError:
+        st.warning("Could not connect to geocoding service. Please select a city from the list.")
+        return None, None
     except Exception as e:
         st.error(f"Geocoding error: {e}")
         return None, None
+    return None, None
 
 def fetch_weather_forecast(city):
     lat, lon = get_city_coords(city)
@@ -187,7 +212,7 @@ if forecast_button:
                     with tab1:
                         plot_df = pd.DataFrame({"datetime": weather_df_processed.index, "pm25": pm25_predictions})
                         fig, ax = plt.subplots(figsize=(10, 6), facecolor='white')
-                        ax.set_facecolor('white')
+                        ax.set_face_color('white')
                         ax.plot(plot_df["datetime"], plot_df["pm25"], marker='o', color='black', linewidth=2)
                         max_pm25 = max(plot_df["pm25"]) * 1.2
                         y_max = max(60, max_pm25)
@@ -229,25 +254,24 @@ st.markdown("---")
 
 st.header("AQI Categories Legend")
 aqi_categories = [
-    {"name": "Good", "color": "#00e400", "range": "0-12", "description": "Air quality is satisfactory, poses little or no risk."},
-    {"name": "Moderate", "color": "#ffff00", "range": "12.1-35.4", "description": "Acceptable air quality, but moderate health concern for very sensitive individuals."},
-    {"name": "Unhealthy for Sensitive Groups", "color": "#ff7e00", "range": "35.5-55.4", "description": "Members of sensitive groups may experience health effects."},
-    {"name": "Unhealthy", "color": "#ff0000", "range": "55.5-150.4", "description": "Everyone may begin to experience health effects."},
-    {"name": "Very Unhealthy", "color": "#8f3f97", "range": "150.5-250.4", "description": "Health alert: everyone may experience more serious health effects."},
-    {"name": "Hazardous", "color": "#7e0023", "range": "250.5+", "description": "Health warning of emergency conditions, entire population likely affected."}
+    {"name": "Good", "color": "#00e400", "range": "0-12"},
+    {"name": "Moderate", "color": "#ffff00", "range": "12.1-35.4"},
+    {"name": "Unhealthy for Sensitive Groups", "color": "#ff7e00", "range": "35.5-55.4"},
+    {"name": "Unhealthy", "color": "#ff0000", "range": "55.5-150.4"},
+    {"name": "Very Unhealthy", "color": "#8f3f97", "range": "150.5-250.4"},
+    {"name": "Hazardous", "color": "#7e0023", "range": "250.5+"}
 ]
 
-cols = st.columns(3)
+cols = st.columns(6)
 for i, category in enumerate(aqi_categories):
-    with cols[i % 3]:
+    with cols[i]:
         text_color = 'black' if category['name'] not in ['Unhealthy', 'Very Unhealthy', 'Hazardous'] else 'white'
         if category['name'] == 'Moderate': text_color = '#333333'
         st.markdown(
             f'''
-            <div style="background-color: {category['color']}; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); color: {text_color};">
-                <h3 style="margin-top: 0; margin-bottom: 8px; font-weight: 600;">{category['name']}</h3>
-                <div style="font-size: 1.0em; margin-bottom: 8px; font-weight: 500;">PM2.5: {category['range']} μg/m³</div>
-                <div style="font-size: 0.9em; line-height: 1.4;">{category['description']}</div>
+            <div style="background-color: {category['color']}; padding: 10px; border-radius: 5px; margin-bottom: 10px; color: {text_color}; text-align: center;">
+                <div style="font-weight: bold;">{category['name']}</div>
+                <div style="font-size: 0.8em;">{category['range']}</div>
             </div>
             ''',
             unsafe_allow_html=True
