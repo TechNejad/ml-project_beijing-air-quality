@@ -1,5 +1,3 @@
-
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -211,8 +209,8 @@ if forecast_button:
                     tab1, tab2 = st.tabs(["Forecast Chart", "Detailed Data"])
                     with tab1:
                         plot_df = pd.DataFrame({"datetime": weather_df_processed.index, "pm25": pm25_predictions})
-                        fig, ax = plt.subplots(figsize=(10, 6), facecolor='white')
-                        ax.set_face_color('white')
+                        fig, ax = plt.subplots(figsize=(10, 6))
+                        fig.set_facecolor('white')
                         ax.plot(plot_df["datetime"], plot_df["pm25"], marker='o', color='black', linewidth=2)
                         max_pm25 = max(plot_df["pm25"]) * 1.2
                         y_max = max(60, max_pm25)
