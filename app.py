@@ -5,8 +5,6 @@ import matplotlib.pyplot as plt
 import datetime
 import requests
 import joblib
-from pathlib import Path
-from ucimlrepo import fetch_ucirepo
 
 # Set page configuration
 st.set_page_config(
@@ -14,6 +12,16 @@ st.set_page_config(
     page_icon="🌬️",
     layout="wide"
 )
+
+# Load the trained model
+try:
+    model = joblib.load('rf_pm25_model.pkl')
+except FileNotFoundError:
+    st.error("Error: Model file 'rf_pm25_model.pkl' not found. Please make sure the model file is in the same directory as the app.")
+    st.stop()
+except Exception as e:
+    st.error(f"Error loading the model: {e}")
+    st.stop()
 
 # Set light theme for the entire application
 st.markdown("""
@@ -41,19 +49,19 @@ st.markdown("""
         gap: 2px;
         background-color: #F0F2F6;
     }
-    
     .stTabs [data-baseweb="tab"] {
         height: 50px;
         white-space: pre-wrap;
         background-color: #F0F2F6;
         border-radius: 4px 4px 0 0;
-        padding: 10px 16px;
-        margin-right: 4px;
+        gap: 1px;
+        padding-top: 10px;
+        padding-bottom: 10px;
+        color: #262730;
     }
-    
     .stTabs [aria-selected="true"] {
         background-color: #FFFFFF;
-        border-bottom: 2px solid #FF4B4B;
+        border-radius: 4px 4px 0 0;
     }
     
     /* Override dark theme elements */
@@ -81,7 +89,7 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
-# App title
+# App title only
 st.title("Air Pollution Forecast")
 
 # Sidebar for inputs
@@ -94,259 +102,465 @@ with st.sidebar:
     # Forecast button
     forecast_button = st.button("Get Pollution Forecast", type="primary")
 
-# Load the trained model
-@st.cache_resource
-def load_model():
-    model_path = Path(__file__).parent / 'rf_pm25_model.pkl'
-    if not model_path.exists():
-        raise FileNotFoundError(
-            "Model file 'rf_pm25_model.pkl' not found. "
-            "Please ensure the model file is in the same directory as this script."
-        )
-    return joblib.load(model_path)
-
-# Load historical data for bootstrapping predictions
-@st.cache_data
-def load_historical_data():
-    beijing_pm2_5 = fetch_ucirepo(id=381)
-    df = beijing_pm2_5.data.features
-    df['pm2.5'] = beijing_pm2_5.data.targets
-    df['datetime'] = pd.to_datetime(df[['year', 'month', 'day', 'hour']])
-    df = df.set_index('datetime')
-    df = df.sort_index()
-    df['pm2.5'] = df['pm2.5'].ffill()
-    return df[['pm2.5']].tail(24) # Return last 24 hours
-
-# Load model and data
-model = load_model()
-historical_data = load_historical_data()
-
-# Function to fetch weather forecast data
+# Function to fetch weather forecast data from Open-Meteo
 def fetch_weather_forecast(city):
-    """Get weather forecast data from Open-Meteo API"""
+    """Get weather forecast data from Open-Meteo CMA API"""
+    # Default coordinates for common cities
     city_coordinates = {
         "beijing": {"lat": 39.9042, "lon": 116.4074},
         "shanghai": {"lat": 31.2304, "lon": 121.4737},
         "guangzhou": {"lat": 23.1291, "lon": 113.2644},
         "shenzhen": {"lat": 22.5431, "lon": 114.0579},
         "chengdu": {"lat": 30.5728, "lon": 104.0668},
+        "tianjin": {"lat": 39.3434, "lon": 117.3616},
+        "wuhan": {"lat": 30.5928, "lon": 114.3055},
+        "xian": {"lat": 34.3416, "lon": 108.9398},
+        "hangzhou": {"lat": 30.2741, "lon": 120.1551},
+        "nanjing": {"lat": 32.0603, "lon": 118.7969}
     }
     
+    # Use provided coordinates or look up by city name
+    city_key = city.lower().replace(" ", "")
+    if city_key in city_coordinates:
+        lat = city_coordinates[city_key]["lat"]
+        lon = city_coordinates[city_key]["lon"]
+    else:
+        # Default to Beijing if city not found
+        lat = city_coordinates["beijing"]["lat"]
+        lon = city_coordinates["beijing"]["lon"]
+    
     try:
-        city_lower = city.lower()
-        coords = city_coordinates.get(city_lower, city_coordinates["beijing"])
+        # Define the API endpoint
+        url = "https://api.open-meteo.com/v1/cma"
         
-        url = "https://api.open-meteo.com/v1/forecast"
+        # Define the parameters
         params = {
-            "latitude": coords["lat"],
-            "longitude": coords["lon"],
-            "hourly": [
-                "temperature_2m", "relative_humidity_2m", "pressure_msl",
-                "wind_speed_10m", "wind_direction_10m", "precipitation"
-            ],
-            "timezone": "auto",
-            "forecast_days": 3
+            "latitude": lat,
+            "longitude": lon,
+            "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,precipitation,wind_speed_10m,wind_direction_10m",
+            "forecast_days": 3,
+            "timezone": "auto"
         }
         
+        # Make the API request
         response = requests.get(url, params=params)
-        response.raise_for_status()
-        return response.json()
+        response.raise_for_status()  # Raise exception for HTTP errors
+        data = response.json()
+        
+        # Process the data into a format compatible with our model
+        processed_data = process_open_meteo_data(data, city)
+        return processed_data
+    
     except Exception as e:
         st.error(f"Error fetching weather data: {e}")
         return None
 
-def create_features(df, pm_data):
-    """Create all features required by the model"""
-    df['datetime'] = pd.to_datetime(df['datetime'])
-    df = df.set_index('datetime')
+def process_open_meteo_data(data, city):
+    """
+    Process Open-Meteo API response into a format compatible with our model
+    """
+    # Extract hourly data
+    hourly = data.get("hourly", {})
     
-    # Combine with historical pm2.5 data
-    full_df = pd.concat([pm_data, df], axis=0)
-    full_df = full_df.sort_index()
+    # Create a list of forecast items
+    forecast_list = []
     
-    # Basic time features
-    df['hour'] = df.index.hour
-    df['day'] = df.index.day
-    df['month'] = df.index.month
+    # Get the time values
+    time_values = hourly.get("time", [])
+    
+    for i in range(len(time_values)):
+        # Convert ISO time string to timestamp
+        dt_str = time_values[i]
+        dt = datetime.datetime.fromisoformat(dt_str)
+        
+        # Extract weather variables for this time step
+        temp = hourly.get("temperature_2m", [])[i]
+        humidity = hourly.get("relative_humidity_2m", [])[i]
+        dew_point = hourly.get("dew_point_2m", [])[i]
+        pressure = hourly.get("pressure_msl", [])[i]
+        precipitation = hourly.get("precipitation", [])[i]
+        wind_speed = hourly.get("wind_speed_10m", [])[i]
+        wind_direction = hourly.get("wind_direction_10m", [])[i]
+        
+        # Create forecast item in a format similar to OpenWeather API
+        forecast_item = {
+            "dt": dt,
+            "Temp": temp,
+            "DewP": dew_point,
+            "Press": pressure,
+            "WindSpeed": wind_speed,
+            "WinDir": wind_direction,
+            "HoursOfRain": precipitation,
+            "HoursOfSnow": 0  # Assuming no snow data from this API
+        }
+        
+        forecast_list.append(forecast_item)
+    
+    return forecast_list
+
+# Function to preprocess weather data for model input
+def preprocess_for_model(df):
+    """Transform weather data into format expected by the model"""
+    
+    # Rename columns to match model's expected input
+    df = df.rename(columns={
+        "dt": "datetime",
+    })
+    df.set_index('datetime', inplace=True)
+
+    # Feature Engineering from the notebook
+    df['WindSpeed_Winsorized'] = df['WindSpeed'] # Simplified for the app
+    df['HoursOfRain_rolling'] = df['HoursOfRain'].rolling(window=24, min_periods=1).sum()
+    df['HoursOfSnow_rolling'] = df['HoursOfSnow'].rolling(window=24, min_periods=1).sum()
+
+    wind_direction_mapping = {
+        'N': 0, 'NNE': 22.5, 'NE': 45, 'ENE': 67.5,
+        'E': 90, 'ESE': 112.5, 'SE': 135, 'SSE': 157.5,
+        'S': 180, 'SSW': 202.5, 'SW': 225, 'WSW': 247.5,
+        'W': 270, 'WNW': 292.5, 'NW': 315, 'NNW': 337.5,
+        'cv': 0
+    }
+    
+    # Convert wind direction degrees to categories for mapping
+    def degrees_to_cardinal(d):
+        dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
+        ix = int(round(d / (360. / len(dirs))))
+        return dirs[ix % len(dirs)]
+
+    df['WinDir_cat'] = df['WinDir'].apply(degrees_to_cardinal)
+    df['WinDir_degrees'] = df['WinDir_cat'].str.lower().map(wind_direction_mapping)
+    df['WinDir_U'] = np.sin(np.radians(df['WinDir_degrees'])) * df['WindSpeed']
+    df['WinDir_V'] = np.cos(np.radians(df['WinDir_degrees'])) * df['WindSpeed']
+
     df['day_of_week'] = df.index.dayofweek
     df['day_of_year'] = df.index.dayofyear
-    df['is_weekend'] = df['day_of_week'].isin([5, 6]).astype(int)
+    df['month'] = df.index.month
+    df['hour'] = df.index.hour
+    df['is_weekend'] = (df['day_of_week'] >= 5).astype(int)
 
-    # Time of day
-    def get_time_of_day(hour):
-        if 5 <= hour < 12: return 'morning'
-        elif 12 <= hour < 17: return 'afternoon'
-        elif 17 <= hour < 21: return 'evening'
-        else: return 'night'
-    df['time_of_day'] = df['hour'].apply(get_time_of_day)
-
-    # Season
     def get_season(month):
-        if 3 <= month <= 5: return 'spring'
-        elif 6 <= month <= 8: return 'summer'
-        elif 9 <= month <= 11: return 'fall'
-        else: return 'winter'
+        if month in [12, 1, 2]: return 'Winter'
+        elif month in [3, 4, 5]: return 'Spring'
+        elif month in [6, 7, 8]: return 'Summer'
+        else: return 'Fall'
     df['Season'] = df['month'].apply(get_season)
 
-    # Wind components
-    wind_dir_rad = np.radians(df['WindDirection'])
-    df['WinDir_U'] = -df['WindSpeed'] * np.sin(wind_dir_rad)
-    df['WinDir_V'] = -df['WindSpeed'] * np.cos(wind_dir_rad)
-
-    # Weather features
-    df['HoursOfRain'] = (df['Precipitation'] > 0).astype(int)
-    df['HoursOfSnow'] = 0 # Simplified
-    df['HoursOfRain_rolling'] = df['HoursOfRain'].rolling(window=3, min_periods=1).mean()
-    df['HoursOfSnow_rolling'] = df['HoursOfSnow'].rolling(window=3, min_periods=1).mean()
+    def get_time_of_day(hour):
+        if 0 <= hour < 6: return 'Night'
+        elif 6 <= hour < 12: return 'Morning'
+        elif 12 <= hour < 18: return 'Afternoon'
+        else: return 'Evening'
+    df['time_of_day'] = df['hour'].apply(get_time_of_day)
     
-    # Winsorize WindSpeed
-    wind_speed_99 = df['WindSpeed'].quantile(0.99)
-    df['WindSpeed_Winsorized'] = df['WindSpeed'].clip(upper=wind_speed_99)
+    # One-hot encode categorical features
+    df = pd.get_dummies(df, columns=['Season', 'time_of_day'], drop_first=True)
 
-    # Dew Point Approximation
-    df['DewP'] = df['Temp'] - ((100 - df['Humidity']) / 5)
-    
-    # Lag and rolling features for pm2.5
-    for lag in [1, 2, 3, 6, 12, 24]:
-        df[f'pm2.5_lag{lag}'] = full_df['pm2.5'].shift(lag).loc[df.index]
-        
-    df['pm2.5_roll24_mean'] = full_df['pm2.5'].rolling(window=24, min_periods=1).mean().loc[df.index]
-    df['pm2.5_roll24_std'] = full_df['pm2.5'].rolling(window=24, min_periods=1).std().loc[df.index]
-
-    # Placeholder extreme flags
-    df['Extreme_PM2.5'] = 0
-    df['Extreme_Event_VMD_shift1'] = 0
-    
     return df
 
-def iterative_prediction(weather_data, initial_pm_history):
-    """Predict PM2.5 iteratively, using each prediction as history for the next"""
+# Function to predict PM2.5 values
+def predict_pm25(weather_df):
+    """Use the loaded model to predict PM2.5 values"""
     
-    hourly_data = weather_data['hourly']
-    forecast_df = pd.DataFrame({
-        'datetime': pd.to_datetime(hourly_data['time']),
-        'Temp': hourly_data['temperature_2m'],
-        'Humidity': hourly_data['relative_humidity_2m'],
-        'Press': hourly_data['pressure_msl'],
-        'WindSpeed': hourly_data['wind_speed_10m'],
-        'WindDirection': hourly_data['wind_direction_10m'],
-        'Precipitation': hourly_data['precipitation'],
-    })
+    # The model expects a specific set of features.
+    # We need to create a dataframe with these features.
+    # The order of columns must match the training data.
     
-    pm_history = initial_pm_history.copy()
-    predictions = []
+    # These are the features the model was trained on
+    model_features = [
+        'DewP', 'Temp', 'Press', 'WindSpeed', 'HoursOfSnow', 'HoursOfRain',
+        'WindSpeed_Winsorized', 'HoursOfRain_rolling', 'HoursOfSnow_rolling',
+        'WinDir_U', 'WinDir_V', 'day_of_week', 'day_of_year', 'is_weekend',
+        'month', 'hour', 'Season_Fall', 'Season_Spring', 'Season_Summer',
+        'Season_Winter', 'time_of_day_Evening', 'time_of_day_Morning',
+        'time_of_day_Night'
+    ]
 
-    for i in range(len(forecast_df)):
-        current_hour_data = forecast_df.iloc[[i]]
-        
-        # Create features for the current hour
-        features_df = create_features(current_hour_data.copy(), pm_history)
-        
-        # Ensure all required columns are present and in order
-        required_features = model.feature_names_in_
-        features_df = features_df.reindex(columns=required_features, fill_value=0)
+    # Create a dataframe with the correct columns, initialized to 0
+    X = pd.DataFrame(0, index=weather_df.index, columns=model_features)
 
-        # Predict
-        prediction = model.predict(features_df)[0]
-        predictions.append(prediction)
-        
-        # Add prediction to history for next iteration
-        new_row = pd.DataFrame({'pm2.5': [prediction]}, index=[current_hour_data.iloc[0]['datetime']])
-        pm_history = pd.concat([pm_history, new_row]).sort_index()
+    # Fill in the values from the preprocessed weather_df
+    for col in weather_df.columns:
+        if col in X.columns:
+            X[col] = weather_df[col]
 
-    forecast_df['pm2.5_prediction'] = predictions
-    return forecast_df
+    # Handle the one-hot encoded columns
+    if 'Season_Fall' in weather_df.columns: X['Season_Fall'] = weather_df['Season_Fall']
+    if 'Season_Spring' in weather_df.columns: X['Season_Spring'] = weather_df['Season_Spring']
+    if 'Season_Summer' in weather_df.columns: X['Season_Summer'] = weather_df['Season_Summer']
+    if 'Season_Winter' in weather_df.columns: X['Season_Winter'] = weather_df['Season_Winter']
+    if 'time_of_day_Evening' in weather_df.columns: X['time_of_day_Evening'] = weather_df['time_of_day_Evening']
+    if 'time_of_day_Morning' in weather_df.columns: X['time_of_day_Morning'] = weather_df['time_of_day_Morning']
+    if 'time_of_day_Night' in weather_df.columns: X['time_of_day_Night'] = weather_df['time_of_day_Night']
+    
+    # Ensure all columns are present, fill missing with 0
+    for col in model_features:
+        if col not in X.columns:
+            X[col] = 0
+            
+    # Reorder columns to match the model's training order
+    X = X[model_features]
 
+    # Make predictions
+    predictions = model.predict(X)
+    return predictions
+
+# Function to convert PM2.5 values to AQI categories
 def pm25_to_aqi_category(pm25):
     """Convert PM2.5 concentration to AQI category"""
-    if pm25 <= 12: return "Good", "#00e400"
-    elif pm25 <= 35.4: return "Moderate", "#ffff00"
-    elif pm25 <= 55.4: return "Unhealthy for Sensitive Groups", "#ff7e00"
-    elif pm25 <= 150.4: return "Unhealthy", "#ff0000"
-    elif pm25 <= 250.4: return "Very Unhealthy", "#8f3f97"
-    else: return "Hazardous", "#7e0023"
+    if pm25 <= 12:
+        return "Good", "#00e400"  # Green
+    elif pm25 <= 35.4:
+        return "Moderate", "#ffff00"  # Yellow
+    elif pm25 <= 55.4:
+        return "Unhealthy for Sensitive Groups", "#ff7e00"  # Orange
+    elif pm25 <= 150.4:
+        return "Unhealthy", "#ff0000"  # Red
+    elif pm25 <= 250.4:
+        return "Very Unhealthy", "#8f3f97"  # Purple
+    else:
+        return "Hazardous", "#7e0023"  # Maroon
 
-def generate_forecast_summary(forecast_df):
-    """Generate a human-readable summary of the forecast"""
-    if forecast_df.empty:
+# Function to generate forecast summary
+def generate_forecast_summary(weather_df, pm25_predictions):
+    """Generate a condensed human-friendly summary of the forecast"""
+    if weather_df.empty or not pm25_predictions.any():
         return "No forecast data available."
     
-    max_pm25 = forecast_df['pm2.5_prediction'].max()
-    worst_aqi, _ = pm25_to_aqi_category(max_pm25)
-    worst_time = forecast_df.loc[forecast_df['pm2.5_prediction'].idxmax(), 'datetime']
-    avg_pm25 = forecast_df['pm2.5_prediction'].mean()
+    # Combine datetime and predictions
+    forecast_df = pd.DataFrame({
+        "datetime": weather_df.index,
+        "pm25": pm25_predictions
+    })
     
-    summary = f"""    ## Forecast Summary
-    - **Worst Air Quality**: {worst_aqi} (PM2.5: {max_pm25:.1f} µg/m³)
-    - **Time of Worst Air Quality**: {worst_time.strftime('%Y-%m-%d %H:%M')}
-    - **Average PM2.5**: {avg_pm25:.1f} µg/m³
-    """
+    # Add AQI categories
+    forecast_df["aqi_category"], forecast_df["aqi_color"] = zip(*forecast_df["pm25"].apply(pm25_to_aqi_category))
     
-    if worst_aqi in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
-        summary += "\n**⚠️ Health Advisory**: Consider limiting outdoor activities."
-    elif worst_aqi == "Unhealthy for Sensitive Groups":
-        summary += "\n**ℹ️ Note**: Sensitive individuals may experience health effects."
+    # Find the worst AQI category overall
+    overall_worst_idx = forecast_df["pm25"].idxmax()
+    overall_worst_category = forecast_df.loc[overall_worst_idx, "aqi_category"]
+    worst_time = forecast_df.loc[overall_worst_idx, "datetime"]
     
-    return summary
+    # Format the date and time
+    date_str = "Today" if worst_time.date() == datetime.datetime.now().date() else (
+        "Tomorrow" if worst_time.date() == (datetime.datetime.now() + datetime.timedelta(days=1)).date() else
+        worst_time.strftime("%A, %B %d")
+    )
+    
+    # Format time period
+    hour = worst_time.hour
+    if 6 <= hour < 12:
+        period = "morning (6-12 AM)"
+    elif 12 <= hour < 18:
+        period = "afternoon (12-6 PM)"
+    else:
+        period = "evening (6-12 PM)" if hour >= 18 else "night (12-6 AM)"
+    
+    # Create a single sentence summary
+    summary = [f"Air quality will be worst on {date_str} during {period}, reaching {overall_worst_category} levels."]
+    
+    # Add health recommendation
+    if overall_worst_category in ["Unhealthy", "Very Unhealthy", "Hazardous"]:
+        summary.append("\n⛔ Outdoor activity is not recommended.")
+    elif overall_worst_category == "Unhealthy for Sensitive Groups":
+        summary.append("\n⚠️ Sensitive individuals should limit outdoor activity.")
+    
+    return "\n\n".join(summary)
 
 # Main app logic
 if forecast_button:
     with st.spinner("Fetching weather data and generating forecast..."):
-        weather_data = fetch_weather_forecast(city)
-        
-        if weather_data:
-            forecast_df = iterative_prediction(weather_data, historical_data)
+            # Fetch weather data
+            weather_data = fetch_weather_forecast(city)
             
-            tab1, tab2 = st.tabs(["Forecast Chart", "Detailed Data"])
-            
-            with tab1:
-                fig, ax = plt.subplots(figsize=(12, 6))
-                ax.plot(forecast_df['datetime'], forecast_df['pm2.5_prediction'], marker='o', linestyle='-', color='#1f77b4', label='Predicted PM2.5')
+            if weather_data:
+                # Preprocess weather data
+                weather_df = pd.DataFrame(weather_data)
+                weather_df_processed = preprocess_for_model(weather_df.copy())
                 
-                aqi_levels = [0, 12, 35.4, 55.4, 150.4, 250.4, 500]
-                aqi_colors = ['#00e400', '#ffff00', '#ff7e00', '#ff0000', '#8f3f97', '#7e0023']
-                for i in range(len(aqi_levels) - 1):
-                    ax.axhspan(aqi_levels[i], aqi_levels[i+1], color=aqi_colors[i], alpha=0.2)
-                
-                ax.set_title(f'PM2.5 Forecast for {city}', fontsize=16)
-                ax.set_xlabel('Date & Time', fontsize=12)
-                ax.set_ylabel('PM2.5 (µg/m³)', fontsize=12)
-                ax.grid(True, linestyle='--', alpha=0.7)
-                plt.xticks(rotation=45)
-                plt.tight_layout()
-                st.pyplot(fig)
-                
-                st.markdown(generate_forecast_summary(forecast_df), unsafe_allow_html=True)
-                
-                st.subheader("AQI Categories")
-                aqi_info = [
-                    {"Range": "0-12", "Category": "Good", "Color": "#00e400"},
-                    {"Range": "12.1-35.4", "Category": "Moderate", "Color": "#ffff00"},
-                    {"Range": "35.5-55.4", "Category": "Unhealthy for Sensitive Groups", "Color": "#ff7e00"},
-                    {"Range": "55.5-150.4", "Category": "Unhealthy", "Color": "#ff0000"},
-                    {"Range": "150.5-250.4", "Category": "Very Unhealthy", "Color": "#8f3f97"},
-                    {"Range": "250.5+", "Category": "Hazardous", "Color": "#7e0023"}
-                ]
-                aqi_df = pd.DataFrame(aqi_info)
-                st.dataframe(
-                    aqi_df.style.apply(lambda x: [f'background-color: {x.Color}' for i in x], axis=1),
-                    column_config={"Color": None, "Range": "PM2.5 (µg/m³)", "Category": "AQI Category"},
-                    use_container_width=True, hide_index=True
-                )
-
-            with tab2:
-                detailed_df = forecast_df[['datetime', 'Temp', 'Humidity', 'Press', 'WindSpeed', 'pm2.5_prediction']].copy()
-                detailed_df['AQI_Category'] = detailed_df['pm2.5_prediction'].apply(lambda x: pm25_to_aqi_category(x)[0])
-                detailed_df = detailed_df.rename(columns={
-                    'datetime': 'Date & Time', 'Temp': 'Temperature (°C)', 'Humidity': 'Humidity (%)',
-                    'Press': 'Pressure (hPa)', 'WindSpeed': 'Wind Speed (m/s)', 'pm2.5_prediction': 'PM2.5 Prediction'
-                })
-                detailed_df['Date & Time'] = detailed_df['Date & Time'].dt.strftime('%Y-%m-%d %H:%M')
-                st.dataframe(detailed_df, use_container_width=True, hide_index=True)
-        else:
-            st.error("Failed to fetch or process weather data.")
+                if not weather_df_processed.empty:
+                    # Predict PM2.5 values
+                    pm25_predictions = predict_pm25(weather_df_processed)
+                    
+                    if pm25_predictions is not None:
+                        # Create tabs for different views with custom CSS to fix visual bug
+                        st.markdown("""
+                        <style>
+                        .stTabs [data-baseweb="tab-list"] {
+                            gap: 10px;
+                        }
+                        .stTabs [data-baseweb="tab"] {
+                            height: 50px;
+                            white-space: pre-wrap;
+                            background-color: #F0F2F6;
+                            border-radius: 4px 4px 0 0;
+                            padding: 10px 16px;
+                            margin-right: 4px;
+                        }
+                        .stTabs [aria-selected="true"] {
+                            background-color: #FFFFFF;
+                            border-bottom: 2px solid #FF4B4B;
+                        }
+                        </style>
+                        """, unsafe_allow_html=True)
+                        
+                        tab1, tab2 = st.tabs(["Forecast Chart", "Detailed Data"])
+                        
+                        with tab1:
+                            # Create a DataFrame for plotting
+                            plot_df = pd.DataFrame({
+                                "datetime": weather_df_processed.index,
+                                "pm25": pm25_predictions
+                            })
+                            
+                            # Create the plot with light theme
+                            fig, ax = plt.subplots(figsize=(10, 6), facecolor='white')
+                            ax.set_facecolor('white')
+                            
+                            # Plot the PM2.5 values
+                            ax.plot(plot_df["datetime"], plot_df["pm25"], marker='o', color='black', linewidth=2)
+                            
+                            # Calculate dynamic y-axis range based on data
+                            max_pm25 = max(plot_df["pm25"]) * 1.2  # Add 20% padding
+                            
+                            # Determine which AQI bands to show based on data range
+                            if max_pm25 <= 60:  # If max is in Unhealthy for Sensitive Groups or lower
+                                y_max = max(60, max_pm25)  # Show at least up to Unhealthy for Sensitive Groups
+                                ax.axhspan(0, 12, alpha=0.3, color='#00e400', label='Good')
+                                ax.axhspan(12, 35.4, alpha=0.3, color='#ffff00', label='Moderate')
+                                ax.axhspan(35.4, 55.4, alpha=0.3, color='#ff7e00', label='Unhealthy for Sensitive Groups')
+                                ax.set_ylim(0, y_max)
+                            elif max_pm25 <= 155:  # If max is in Unhealthy range
+                                y_max = max(155, max_pm25)  # Show at least up to Unhealthy
+                                ax.axhspan(0, 12, alpha=0.3, color='#00e400', label='Good')
+                                ax.axhspan(12, 35.4, alpha=0.3, color='#ffff00', label='Moderate')
+                                ax.axhspan(35.4, 55.4, alpha=0.3, color='#ff7e00', label='Unhealthy for Sensitive Groups')
+                                ax.axhspan(55.4, 150.4, alpha=0.3, color='#ff0000', label='Unhealthy')
+                                ax.set_ylim(0, y_max)
+                            elif max_pm25 <= 255:  # If max is in Very Unhealthy range
+                                y_max = max(255, max_pm25)  # Show at least up to Very Unhealthy
+                                ax.axhspan(0, 12, alpha=0.3, color='#00e400', label='Good')
+                                ax.axhspan(12, 35.4, alpha=0.3, color='#ffff00', label='Moderate')
+                                ax.axhspan(35.4, 55.4, alpha=0.3, color='#ff7e00', label='Unhealthy for Sensitive Groups')
+                                ax.axhspan(55.4, 150.4, alpha=0.3, color='#ff0000', label='Unhealthy')
+                                ax.axhspan(150.4, 250.4, alpha=0.3, color='#8f3f97', label='Very Unhealthy')
+                                ax.set_ylim(0, y_max)
+                            else:  # If max is in Hazardous range
+                                y_max = max(500, max_pm25)  # Show at least up to 500 for Hazardous
+                                ax.axhspan(0, 12, alpha=0.3, color='#00e400', label='Good')
+                                ax.axhspan(12, 35.4, alpha=0.3, color='#ffff00', label='Moderate')
+                                ax.axhspan(35.4, 55.4, alpha=0.3, color='#ff7e00', label='Unhealthy for Sensitive Groups')
+                                ax.axhspan(55.4, 150.4, alpha=0.3, color='#ff0000', label='Unhealthy')
+                                ax.axhspan(150.4, 250.4, alpha=0.3, color='#8f3f97', label='Very Unhealthy')
+                                ax.axhspan(250.4, y_max, alpha=0.3, color='#7e0023', label='Hazardous')
+                                ax.set_ylim(0, y_max)
+                            
+                            # Add labels and title with improved styling for light theme
+                            ax.set_xlabel('Time', color='black', fontsize=12)
+                            ax.set_ylabel('PM2.5 (μg/m³)', color='black', fontsize=12)
+                            ax.set_title(f'Predicted Air Pollution Levels for {city}', color='black', fontsize=14, pad=20)
+                            
+                            # Improve x-axis readability
+                            date_format = plt.matplotlib.dates.DateFormatter('%m-%d\n%H:00')
+                            ax.xaxis.set_major_formatter(date_format)
+                            ax.xaxis.set_major_locator(plt.matplotlib.dates.HourLocator(interval=12))
+                            plt.xticks(color='black', rotation=0)
+                            
+                            # Add grid for better trend visibility
+                            ax.grid(True, linestyle='--', alpha=0.3, color='gray')
+                            
+                            # Style y-axis ticks
+                            plt.yticks(color='black')
+                            
+                            # Remove legend from the figure as requested
+                            if ax.get_legend():
+                                ax.get_legend().remove()
+                            
+                            # Add trend indicator arrow for overall trend
+                            if len(plot_df) > 1:
+                                first_val = plot_df["pm25"].iloc[0]
+                                last_val = plot_df["pm25"].iloc[-1]
+                                trend_text = "↗️ Rising" if last_val > first_val else "↘️ Falling" if last_val < first_val else "→ Stable"
+                                ax.text(0.02, 0.98, trend_text, transform=ax.transAxes, 
+                                       color='black', fontsize=12, verticalalignment='top',
+                                       bbox=dict(facecolor='white', alpha=0.7, edgecolor='lightgray'))
+                            
+                            # Adjust layout to make room for the legend
+                            plt.tight_layout()
+                            plt.subplots_adjust(right=0.75)
+                            
+                            # Display the plot
+                            st.pyplot(fig)
+                            
+                            # Display forecast summary
+                            st.header("Forecast Summary")
+                            summary = generate_forecast_summary(weather_df_processed, pm25_predictions)
+                            st.markdown(summary)
+                            
+                            # Display AQI categories legend with colorful boxes
+                            st.header("AQI Categories Legend")
+                            
+                            # Create a more visually appealing legend with colored boxes
+                            aqi_categories = [
+                                {"name": "Good", "color": "#00e400", "range": "0-12", "description": "Air quality is satisfactory, poses little or no risk."},
+                                {"name": "Moderate", "color": "#ffff00", "range": "12.1-35.4", "description": "Acceptable air quality, but moderate health concern for very sensitive individuals."},
+                                {"name": "Unhealthy for Sensitive Groups", "color": "#ff7e00", "range": "35.5-55.4", "description": "Members of sensitive groups may experience health effects."},
+                                {"name": "Unhealthy", "color": "#ff0000", "range": "55.5-150.4", "description": "Everyone may begin to experience health effects."},
+                                {"name": "Very Unhealthy", "color": "#8f3f97", "range": "150.5-250.4", "description": "Health alert: everyone may experience more serious health effects."},
+                                {"name": "Hazardous", "color": "#7e0023", "range": "250.5+", "description": "Health warning of emergency conditions, entire population likely affected."}
+                            ]
+                            
+                            # Create a more visually appealing legend with colored boxes using Streamlit columns
+                            cols = st.columns(3)
+                            
+                            for i, category in enumerate(aqi_categories):
+                                col_idx = i % 3
+                                with cols[col_idx]:
+                                    # Determine text color based on background for optimal readability
+                                    text_color = 'black'
+                                    if category['name'] in ['Unhealthy', 'Very Unhealthy', 'Hazardous']:
+                                        text_color = 'white'
+                                    elif category['name'] == 'Moderate':
+                                        text_color = '#333333'  # Darker text for yellow background
+                                        
+                                    # Create a colored box with category information - improved styling
+                                    st.markdown(
+                                        f"""
+                                        <div style="background-color: {category['color']}; 
+                                                    padding: 15px; 
+                                                    border-radius: 8px; 
+                                                    margin-bottom: 15px;
+                                                    box-shadow: 0 2px 5px rgba(0,0,0,0.1);
+                                                    color: {text_color};">
+                                            <h3 style="margin-top: 0; margin-bottom: 8px; font-weight: 600;">{category['name']}</h3>
+                                            <div style="font-size: 1.0em; margin-bottom: 8px; font-weight: 500;">PM2.5: {category['range']} μg/m³</div>
+                                            <div style="font-size: 0.9em; line-height: 1.4;">{category['description']}</div>
+                                        </div>
+                                        """,
+                                        unsafe_allow_html=True
+                                    )
+                        
+                        with tab2:
+                            # Display detailed forecast data
+                            detailed_df = pd.DataFrame({
+                                "Date & Time": weather_df_processed.index,
+                                "Temperature (°C)": weather_df_processed["Temp"],
+                                "Humidity (%)": weather_df_processed.get("humidity", "N/A"), # Added .get for safety
+                                "Wind Speed (km/h)": weather_df_processed["WindSpeed"],
+                                "Pressure (hPa)": weather_df_processed["Press"],
+                                "Predicted PM2.5 (μg/m³)": pm25_predictions
+                            })
+                            
+                            # Add AQI category
+                            detailed_df["AQI Category"] = [pm25_to_aqi_category(pm25)[0] for pm25 in pm25_predictions]
+                            
+                            # Display the detailed data
+                            st.dataframe(detailed_df, hide_index=True)
+                    else:
+                        st.error("Failed to generate PM2.5 predictions.")
+                else:
+                    st.error("Failed to process weather data.")
+            else:
+                st.error("Failed to fetch weather data.")
 
 # Footer
 st.markdown("---")
-st.markdown("### About")
-st.markdown("This app provides air quality forecasts using a Random Forest model trained on historical data from Beijing.")
