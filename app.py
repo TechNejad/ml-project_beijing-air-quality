@@ -1,3 +1,5 @@
+
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -23,88 +25,14 @@ except Exception as e:
     st.error(f"Error loading the model: {e}")
     st.stop()
 
-# Set light theme for the entire application
-st.markdown("""
-<style>
-    /* Main content area */
-    .main .block-container {
-        background-color: #FFFFFF;
-        color: #262730;
-        padding: 2rem;
-    }
-    
-    /* Sidebar */
-    section[data-testid="stSidebar"] {
-        background-color: #F0F2F6;
-        color: #262730;
-    }
-    
-    /* Headers */
-    h1, h2, h3, h4, h5, h6 {
-        color: #262730;
-    }
-    
-    /* Tabs */
-    .stTabs [data-baseweb="tab-list"] {
-        gap: 2px;
-        background-color: #F0F2F6;
-    }
-    .stTabs [data-baseweb="tab"] {
-        height: 50px;
-        white-space: pre-wrap;
-        background-color: #F0F2F6;
-        border-radius: 4px 4px 0 0;
-        gap: 1px;
-        padding-top: 10px;
-        padding-bottom: 10px;
-        color: #262730;
-    }
-    .stTabs [aria-selected="true"] {
-        background-color: #FFFFFF;
-        border-radius: 4px 4px 0 0;
-    }
-    
-    /* Override dark theme elements */
-    .stApp {
-        background-color: #FFFFFF;
-    }
-    
-    /* Text color */
-    .stMarkdown, p, div {
-        color: #262730;
-    }
-    
-    /* Tab content */
-    .stTabContent {
-        background-color: #FFFFFF;
-        padding: 1rem;
-        border-radius: 0 0 4px 4px;
-    }
-    
-    /* Button styling */
-    .stButton button {
-        background-color: #FF4B4B;
-        color: white;
-    }
-</style>
-""", unsafe_allow_html=True)
-
-# App title only
 st.title("Air Pollution Forecast")
 
-# Sidebar for inputs
 with st.sidebar:
     st.header("Settings")
-    
-    # City selector (default: Beijing)
     city = st.text_input("City", value="Beijing")
-    
-    # Forecast button
     forecast_button = st.button("Get Pollution Forecast", type="primary")
 
-# Function to fetch weather forecast data from Open-Meteo
 def fetch_weather_forecast(city):
-    """Get weather forecast data from Open-Meteo CMA API"""
     city_coordinates = {
         "beijing": {"lat": 39.9042, "lon": 116.4074},
         "shanghai": {"lat": 31.2304, "lon": 121.4737},
@@ -119,7 +47,7 @@ def fetch_weather_forecast(city):
         params = {
             "latitude": lat,
             "longitude": lon,
-            "hourly": "temperature_2m,relative_humidity_2m,dew_point_2m,pressure_msl,surface_pressure,precipitation,wind_speed_10m,wind_direction_10m",
+            "hourly": "temperature_2m,dew_point_2m,pressure_msl,precipitation,wind_speed_10m,wind_direction_10m",
             "forecast_days": 3,
             "timezone": "auto"
         }
@@ -131,7 +59,6 @@ def fetch_weather_forecast(city):
         return None
 
 def process_open_meteo_data(data):
-    """Process Open-Meteo API response into a DataFrame."""
     hourly = data.get("hourly", {})
     time_values = hourly.get("time", [])
     if not time_values:
@@ -145,30 +72,26 @@ def process_open_meteo_data(data):
         'WindSpeed': hourly.get("wind_speed_10m"),
         'WinDir': hourly.get("wind_direction_10m"),
         'HoursOfRain': hourly.get("precipitation"),
-        'HoursOfSnow': 0  # Assuming no snow
+        'HoursOfSnow': 0
     })
     return df
 
 def preprocess_for_model(df):
-    """Transform weather data into the format expected by the model's pipeline."""
     df.set_index('datetime', inplace=True)
 
-    # Feature Engineering from the notebook
-    df['WindSpeed_Winsorized'] = df['WindSpeed']
+    # --- Replicate ALL feature engineering from the notebook ---
+    df['WindSpeed_Winsorized'] = df['WindSpeed'] 
     df['HoursOfRain_rolling'] = df['HoursOfRain'].rolling(window=24, min_periods=1).sum()
     df['HoursOfSnow_rolling'] = df['HoursOfSnow'].rolling(window=24, min_periods=1).sum()
 
     def degrees_to_cardinal(d):
         dirs = ['N', 'NNE', 'NE', 'ENE', 'E', 'ESE', 'SE', 'SSE', 'S', 'SSW', 'SW', 'WSW', 'W', 'WNW', 'NW', 'NNW']
         return dirs[int(round(d / (360. / len(dirs)))) % len(dirs)]
-
     df['WinDir'] = df['WinDir'].apply(degrees_to_cardinal)
 
     wind_direction_mapping = {
-        'n': 0, 'nne': 22.5, 'ne': 45, 'ene': 67.5,
-        'e': 90, 'ese': 112.5, 'se': 135, 'sse': 157.5,
-        's': 180, 'ssw': 202.5, 'sw': 225, 'wsw': 247.5,
-        'w': 270, 'wnw': 292.5, 'nw': 315, 'nnw': 337.5,
+        'n': 0, 'nne': 22.5, 'ne': 45, 'ene': 67.5, 'e': 90, 'ese': 112.5, 'se': 135, 'sse': 157.5,
+        's': 180, 'ssw': 202.5, 'sw': 225, 'wsw': 247.5, 'w': 270, 'wnw': 292.5, 'nw': 315, 'nnw': 337.5,
     }
     df['WinDir_degrees'] = df['WinDir'].str.lower().map(wind_direction_mapping).fillna(0)
     df['WinDir_U'] = np.sin(np.radians(df['WinDir_degrees'])) * df['WindSpeed']
@@ -194,24 +117,28 @@ def preprocess_for_model(df):
         else: return 'Evening'
     df['time_of_day'] = df['hour'].apply(get_time_of_day)
 
+    # *** FIX: Add the missing columns the model expects ***
+    # For a live forecast, we assume these events are not occurring by default.
+    df['Extreme_PM2.5'] = False
+    df['Extreme_Event_VMD_shift1'] = False
+
+    # Create placeholder lag/rolling features for PM2.5 as we don't have historical data
+    # In a real-world scenario, you'd fetch the last 24 hours of actual PM2.5 data
+    df['pm2.5_lag1'] = 50 # Placeholder value
+    df['pm2.5_lag2'] = 50
+    df['pm2.5_lag3'] = 50
+    df['pm2.5_lag6'] = 50
+    df['pm2.5_lag12'] = 50
+    df['pm2.5_lag24'] = 50
+    df['pm2.5_roll24_mean'] = 50
+    df['pm2.5_roll24_std'] = 5
+
     return df
 
 def predict_pm25(weather_df):
     """Use the loaded model pipeline to predict PM2.5 values."""
-    model_features = [
-        'DewP', 'Temp', 'Press', 'WindSpeed', 'HoursOfSnow', 'HoursOfRain',
-        'WindSpeed_Winsorized', 'HoursOfRain_rolling', 'HoursOfSnow_rolling',
-        'WinDir_U', 'WinDir_V', 'day_of_week', 'day_of_year', 'is_weekend',
-        'month', 'hour', 'Season', 'time_of_day'
-    ]
-    
-    # Ensure all required columns are present
-    for col in model_features:
-        if col not in weather_df.columns:
-            weather_df[col] = 0  # Add missing columns with a default value
-
-    X = weather_df[model_features]
-    predictions = model.predict(X)
+    # The pipeline handles column selection and transformations internally
+    predictions = model.predict(weather_df)
     return predictions
 
 def pm25_to_aqi_category(pm25):
