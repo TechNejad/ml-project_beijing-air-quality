@@ -1,5 +1,3 @@
-
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -29,18 +27,30 @@ st.title("Air Pollution Forecast")
 
 with st.sidebar:
     st.header("Settings")
-    city = st.text_input("City", value="Beijing")
+    city = st.text_input("Enter any city", value="Beijing")
     forecast_button = st.button("Get Pollution Forecast", type="primary")
 
+def get_city_coords(city_name):
+    """Get latitude and longitude for a city using Nominatim API."""
+    try:
+        url = f"https://nominatim.openstreetmap.org/search?q={city_name}&format=json&limit=1"
+        headers = {'User-Agent': 'Mozilla/5.0'} # Nominatim requires a user-agent
+        response = requests.get(url, headers=headers)
+        response.raise_for_status()
+        data = response.json()
+        if data:
+            return float(data[0]['lat']), float(data[0]['lon'])
+        else:
+            st.error(f"Could not find coordinates for city: {city_name}")
+            return None, None
+    except Exception as e:
+        st.error(f"Geocoding error: {e}")
+        return None, None
+
 def fetch_weather_forecast(city):
-    city_coordinates = {
-        "beijing": {"lat": 39.9042, "lon": 116.4074},
-        "shanghai": {"lat": 31.2304, "lon": 121.4737},
-        "guangzhou": {"lat": 23.1291, "lon": 113.2644}
-    }
-    city_key = city.lower().replace(" ", "")
-    lat = city_coordinates.get(city_key, city_coordinates["beijing"])["lat"]
-    lon = city_coordinates.get(city_key, city_coordinates["beijing"])["lon"]
+    lat, lon = get_city_coords(city)
+    if lat is None or lon is None:
+        return None
     
     try:
         url = "https://api.open-meteo.com/v1/cma"
@@ -78,8 +88,6 @@ def process_open_meteo_data(data):
 
 def preprocess_for_model(df):
     df.set_index('datetime', inplace=True)
-
-    # --- Replicate ALL feature engineering from the notebook ---
     df['WindSpeed_Winsorized'] = df['WindSpeed'] 
     df['HoursOfRain_rolling'] = df['HoursOfRain'].rolling(window=24, min_periods=1).sum()
     df['HoursOfSnow_rolling'] = df['HoursOfSnow'].rolling(window=24, min_periods=1).sum()
@@ -117,14 +125,10 @@ def preprocess_for_model(df):
         else: return 'Evening'
     df['time_of_day'] = df['hour'].apply(get_time_of_day)
 
-    # *** FIX: Add the missing columns the model expects ***
-    # For a live forecast, we assume these events are not occurring by default.
     df['Extreme_PM2.5'] = False
     df['Extreme_Event_VMD_shift1'] = False
 
-    # Create placeholder lag/rolling features for PM2.5 as we don't have historical data
-    # In a real-world scenario, you'd fetch the last 24 hours of actual PM2.5 data
-    df['pm2.5_lag1'] = 50 # Placeholder value
+    df['pm2.5_lag1'] = 50
     df['pm2.5_lag2'] = 50
     df['pm2.5_lag3'] = 50
     df['pm2.5_lag6'] = 50
@@ -136,8 +140,6 @@ def preprocess_for_model(df):
     return df
 
 def predict_pm25(weather_df):
-    """Use the loaded model pipeline to predict PM2.5 values."""
-    # The pipeline handles column selection and transformations internally
     predictions = model.predict(weather_df)
     return predictions
 
@@ -224,3 +226,29 @@ if forecast_button:
         else: st.error("Failed to fetch weather data.")
 
 st.markdown("---")
+
+st.header("AQI Categories Legend")
+aqi_categories = [
+    {"name": "Good", "color": "#00e400", "range": "0-12", "description": "Air quality is satisfactory, poses little or no risk."},
+    {"name": "Moderate", "color": "#ffff00", "range": "12.1-35.4", "description": "Acceptable air quality, but moderate health concern for very sensitive individuals."},
+    {"name": "Unhealthy for Sensitive Groups", "color": "#ff7e00", "range": "35.5-55.4", "description": "Members of sensitive groups may experience health effects."},
+    {"name": "Unhealthy", "color": "#ff0000", "range": "55.5-150.4", "description": "Everyone may begin to experience health effects."},
+    {"name": "Very Unhealthy", "color": "#8f3f97", "range": "150.5-250.4", "description": "Health alert: everyone may experience more serious health effects."},
+    {"name": "Hazardous", "color": "#7e0023", "range": "250.5+", "description": "Health warning of emergency conditions, entire population likely affected."}
+]
+
+cols = st.columns(3)
+for i, category in enumerate(aqi_categories):
+    with cols[i % 3]:
+        text_color = 'black' if category['name'] not in ['Unhealthy', 'Very Unhealthy', 'Hazardous'] else 'white'
+        if category['name'] == 'Moderate': text_color = '#333333'
+        st.markdown(
+            f'''
+            <div style="background-color: {category['color']}; padding: 15px; border-radius: 8px; margin-bottom: 15px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); color: {text_color};">
+                <h3 style="margin-top: 0; margin-bottom: 8px; font-weight: 600;">{category['name']}</h3>
+                <div style="font-size: 1.0em; margin-bottom: 8px; font-weight: 500;">PM2.5: {category['range']} μg/m³</div>
+                <div style="font-size: 0.9em; line-height: 1.4;">{category['description']}</div>
+            </div>
+            ''',
+            unsafe_allow_html=True
+        )
