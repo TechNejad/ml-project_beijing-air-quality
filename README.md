@@ -6,7 +6,7 @@ This repository contains the complete work for a machine learning project that a
 
 ## Live Demo
 
-<a href="https://ml-projectbeijing-air-quality-d9utqmdnrasr3udygjapnn.streamlit.app/" target="_blank">
+<a href="https://ml-projectbeijing-air-quality-gqgd3juiatrt7eop7cdrwb.streamlit.app/" target="_blank">
     <img src="https://static.streamlit.io/badges/streamlit_badge_black_white.svg" alt="Streamlit App"/>
 </a>
 
