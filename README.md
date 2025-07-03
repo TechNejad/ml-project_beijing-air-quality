@@ -1,8 +1,7 @@
 # Beijing Air Quality Forecast: A Machine Learning Project
 
-This machine learning project explores air quality in Beijing from 2010 to 2014, focusing on predicting fine particulate matter (PM2.5) and how it evolves in relation to meteorological and seasonal factors. The dataset is a time series, with hourly readings of PM2.5 and weather conditions such as temperature, wind speed, and pressure. The project culminates in a live, interactive web application that provides real-time air quality information to users.
+This ML project analyzes Beijing's air quality from 2010 to 2014, focusing on predicting PM2.5 levels and their correlation with weather and seasonal factors. We trained and evaluated a Random Forest model, which we then used to create a real-time air quality web app demo providing real-time air quality information. This was a joint project for the 'Fundamentals of ML' and ' Applied Programming for Data Science' courses in the Artificial Intelligence for Sustainable Societies Master's program.
 
-This was a joint project for our Fundamentals of Machine Learning and Applied Programming for Data Science courses as part of the Artificial Intelligence For Sustainable Socieities (AISS) Master's program.
 ---
 
 ## Live Demo
