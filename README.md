@@ -1,7 +1,8 @@
 # Beijing Air Quality Forecast: A Machine Learning Project
 
-This repository contains the complete work for a machine learning project that analyzes and forecasts air pollution in Beijing, using data from 2010 to 2014. The project culminates in a live, interactive web application that provides real-time air quality forecasts.
+This machine learning project explores air quality in Beijing from 2010 to 2014, focusing on predicting fine particulate matter (PM2.5) and how it evolves in relation to meteorological and seasonal factors. The dataset is a time series, with hourly readings of PM2.5 and weather conditions such as temperature, wind speed, and pressure. The project culminates in a live, interactive web application that provides real-time air quality information to users.
 
+This was a joint project for our Fundamentals of Machine Learning and Applied Programming for Data Science courses as part of the Artificial Intelligence For Sustainable Socieities (AISS) Master's program.
 ---
 
 ## Live Demo
@@ -33,31 +34,3 @@ This project follows the CRISP-DM methodology to deliver a comprehensive analysi
 *   **Deployment:** Streamlit Community Cloud
 
 ---
-
-## Repository Structure
-
-*   `Streamlit_WebApp_Demo.py`: The main Streamlit application file.
-*   `rf_pm25_model.pkl`: The trained RandomForest model.
-*   `ML_project_China_Air_Pollution_.ipynb`: The Jupyter Notebook containing the complete data analysis, feature engineering, and model training process.
-*   `requirements.txt`: The Python dependencies for the project.
-*   `runtime.txt`: The Python runtime version for deployment.
-
----
-
-## How to Run the App Locally
-
-1.  **Clone the repository:**
-    ```bash
-    git clone https://github.com/TechNejad/ml-project_beijing-air-quality.git
-    cd ml-project_beijing-air-quality
-    ```
-
-2.  **Install the dependencies:**
-    ```bash
-    pip install -r requirements.txt
-    ```
-
-3.  **Run the Streamlit app:**
-    ```bash
-    streamlit run Streamlit_WebApp_Demo.py
-    ```
